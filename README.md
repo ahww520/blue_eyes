@@ -1,6 +1,6 @@
 # CareEyes Pro
 
-**商业级 Windows 护眼工具 · v5.0**
+**Windows 护眼工具 · v5.1**
 
 > 色温调节 · 休息提醒 · 视力训练 · 多显示器 · 全局快捷键 · 系统托盘
 
@@ -68,13 +68,13 @@
 ### 安装依赖
 
 ```bash
-pip install PyQt5 pywin32 pynput
+pip install -r requirements.txt
 ```
 
 ### 运行
 
 ```bash
-python care_eyes_pro.py
+python mainpro.py
 ```
 
 > **提示**：若护眼效果对某些以管理员权限运行的程序（如游戏）无效，请右键 → 以管理员身份运行。
@@ -83,10 +83,10 @@ python care_eyes_pro.py
 
 ```bash
 pip install pyinstaller
-pyinstaller --noconsole --onefile care_eyes_pro.py
+pyinstaller --noconsole --onefile mainpro.py
 ```
 
-打包后的 `dist/care_eyes_pro.exe` 可直接运行，无需 Python 环境。
+打包后的 `dist/mainpro.exe` 可直接运行，无需 Python 环境。
 
 ---
 
@@ -188,7 +188,7 @@ C:\Users\<你的用户名>\.care_eyes_pro.json
 ## 技术架构
 
 ```
-care_eyes_pro.py
+mainpro.py
 │
 ├── _read_system_accent()     读取 Windows 强调色（注册表）
 ├── _is_admin()               检测当前进程权限
@@ -254,6 +254,7 @@ A: 删除 `C:\Users\<用户名>\.care_eyes_pro.json`，重启程序即恢复默�
 
 | 版本 | 主要变更 |
 |------|---------|
+| **v5.1** | 修复托盘切换、全局快捷键跨线程、窗口关闭退出、重复休息窗口；增加配置范围校验、开关持久化、跨午夜统计和完整设置重置 |
 | **v5.0** | 守护频率800ms、WM_SETTINGCHANGE即时响应、权限检测、多屏热插拔、全屏进程黑白名单、多屏超暗覆盖、配置原子写入、CPU优化、强制休息模式、系统主题色跟随 |
 | **v4.0** | 多显示器Gamma同步、平滑色温渐变、昼夜自动模式、全局快捷键、开机自启动、超暗模式、视力训练动画、休眠唤醒重应用、托盘气泡预警、7天柱状图 |
 | **v3.0** | 系统托盘、自定义休息间隔、休息倒计时、今日用眼统计、6种预设模式 |

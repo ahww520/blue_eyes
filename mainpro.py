@@ -44,7 +44,7 @@ from PyQt5.QtGui import (
 # ─────────────────────────────────────────────
 APP_NAME    = "CareEyesPro"
 APP_TITLE   = "CareEyes Pro"
-APP_VER     = "v5.0"
+APP_VER     = "v5.1"
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".care_eyes_pro.json")
 
 # 全屏检测：这些进程名即便占全屏也不触发推迟（黑名单=不推迟）
@@ -500,9 +500,14 @@ class BarChart(QWidget):
 # 📱  主应用
 # ─────────────────────────────────────────────
 class CareEyesApp(QWidget):
+    hotkey_brightness = pyqtSignal(int)
+    hotkey_temperature = pyqtSignal(int)
+    hotkey_toggle = pyqtSignal()
 
     def __init__(self):
         super().__init__()
+        self._quitting = False
+        self.overlay = None
         # ── 读取系统主题色 (#10) ──
         self._accent = _read_system_accent()
 
@@ -520,6 +525,10 @@ class CareEyesApp(QWidget):
         self._warned_1min = False
         self._transition = SmoothTransition(self)
         self._dim_mgr = DimManager()     # #5 多屏超暗管理器
+
+        self.hotkey_brightness.connect(self._hk_bright)
+        self.hotkey_temperature.connect(self._hk_temp)
+        self.hotkey_toggle.connect(self._hk_toggle)
 
         self.load_settings()
         self.init_ui()
@@ -580,11 +589,11 @@ class CareEyesApp(QWidget):
                     ctrl = {kb.Key.ctrl, kb.Key.ctrl_l, kb.Key.ctrl_r}
                     alt  = {kb.Key.alt,  kb.Key.alt_l,  kb.Key.alt_r}
                     if self._hk_pressed & ctrl and self._hk_pressed & alt:
-                        if key == kb.Key.up:    self._hk_bright(+5)
-                        elif key == kb.Key.down: self._hk_bright(-5)
-                        elif key == kb.Key.right: self._hk_temp(+200)
-                        elif key == kb.Key.left:  self._hk_temp(-200)
-                        elif key == kb.Key.end:   self._hk_toggle()
+                        if key == kb.Key.up:    self.hotkey_brightness.emit(+5)
+                        elif key == kb.Key.down: self.hotkey_brightness.emit(-5)
+                        elif key == kb.Key.right: self.hotkey_temperature.emit(+200)
+                        elif key == kb.Key.left:  self.hotkey_temperature.emit(-200)
+                        elif key == kb.Key.end:   self.hotkey_toggle.emit()
                 except Exception: pass
 
             def _on_release(key):
@@ -707,10 +716,12 @@ class CareEyesApp(QWidget):
 
         top = QHBoxLayout()
         top.addWidget(self._h2("护眼控制")); top.addStretch()
-        self.toggle_label = QLabel("已开启")
-        self.toggle_label.setStyleSheet("color:#0ea5e9;margin-right:8px;")
+        self.toggle_label = QLabel("已开启" if self.is_enabled else "已关闭")
+        self.toggle_label.setStyleSheet(
+            f"color:{self._accent};margin-right:8px;" if self.is_enabled
+            else "color:#484f58;margin-right:8px;")
         self.toggle = AnimatedToggle()
-        self.toggle.setChecked(True); self.toggle.clicked.connect(self.toggle_master)
+        self.toggle.setChecked(self.is_enabled); self.toggle.clicked.connect(self.toggle_master)
         top.addWidget(self.toggle_label); top.addWidget(self.toggle)
         lay.addLayout(top); lay.addSpacing(14)
 
@@ -908,8 +919,8 @@ class CareEyesApp(QWidget):
             cl.addLayout(row); cl.addWidget(self._div())
 
         self.autostart_cb.stateChanged.connect(self._on_autostart_change)
-        self.sound_cb.stateChanged.connect(lambda v: setattr(self,'sound_enabled',bool(v)))
-        self.force_rest_cb.stateChanged.connect(lambda v: setattr(self,'force_rest',bool(v)))
+        self.sound_cb.stateChanged.connect(self._on_sound_toggle)
+        self.force_rest_cb.stateChanged.connect(self._on_force_rest_toggle)
 
         hk = QLabel("全局快捷键\n"
                     "Ctrl+Alt+↑/↓  亮度 ±5%\n"
@@ -950,8 +961,8 @@ class CareEyesApp(QWidget):
         menu = QMenu()
         menu.setStyleSheet("QMenu{background:#161b22;color:#c9d1d9;border:1px solid #30363d;padding:4px;}"
                            "QMenu::item:selected{background:#21262d;}")
-        for label,slot in [("显示主界面",self.show),("切换护眼",self.toggle_master),
-                            (None,None),("退出",QApplication.quit)]:
+        for label,slot in [("显示主界面",self.show),("切换护眼",self._hk_toggle),
+                            (None,None),("退出",self._quit_app)]:
             if label is None: menu.addSeparator()
             else:
                 a=QAction(label,self); a.triggered.connect(slot); menu.addAction(a)
@@ -959,6 +970,15 @@ class CareEyesApp(QWidget):
         self.tray.setToolTip(f"{APP_TITLE} — 运行中")
         self.tray.activated.connect(lambda r: self.show() if r==QSystemTrayIcon.DoubleClick else None)
         self.tray.show()
+
+    def _quit_app(self):
+        self._quitting = True
+        self._save_settings()
+        self._dim_mgr.hide()
+        if hasattr(self, "_hk_listener"):
+            self._hk_listener.stop()
+        DisplayManager.reset()
+        QApplication.quit()
 
     # ══════════════════════════════════════════
     #  电源事件（休眠唤醒）
@@ -995,6 +1015,7 @@ class CareEyesApp(QWidget):
         self.temp_val.setText(f"{self.temp} K")
         self.bright_val.setText(f"{int(self.bright*100)}%")
         self._transition.stop(); self.apply_effect()
+        self._schedule_save()
 
     def apply_preset(self, name):
         p = MODES[name]
@@ -1005,6 +1026,7 @@ class CareEyesApp(QWidget):
             sl.blockSignals(True); sl.setValue(val); sl.blockSignals(False)
         self.temp_val.setText(f"{self.temp} K")
         self.bright_val.setText(f"{int(self.bright*100)}%")
+        self._save_settings()
 
     def toggle_master(self):
         self.is_enabled = self.toggle.isChecked()
@@ -1020,6 +1042,7 @@ class CareEyesApp(QWidget):
             self._transition.stop()
             self.guard_timer.stop()               # #7 停止守护节省 CPU
             DisplayManager.reset()
+        self._save_settings()
 
     def apply_effect(self):
         if self.is_enabled: DisplayManager.apply(self.temp, self.bright)
@@ -1035,6 +1058,7 @@ class CareEyesApp(QWidget):
         self._warned_1min = False
         self.rest_timer.stop()
         self.rest_timer.start(self.rest_interval_min * 60 * 1000)
+        self._save_settings()
 
     def _on_rest_trigger(self):
         if self._is_fullscreen():
@@ -1046,8 +1070,12 @@ class CareEyesApp(QWidget):
         self.show_rest_overlay()
 
     def show_rest_overlay(self):
+        if self.overlay is not None and self.overlay.isVisible():
+            self.overlay.raise_()
+            return
         self.overlay = EyeExerciseOverlay(self.rest_duration_sec,
                                           force_mode=self.force_rest)
+        self.overlay.destroyed.connect(lambda: setattr(self, "overlay", None))
         self.overlay.show()
         self._next_rest_secs = self.rest_interval_min * 60
         self._warned_1min = False; self.break_count += 1
@@ -1062,8 +1090,13 @@ class CareEyesApp(QWidget):
                                   QSystemTrayIcon.Information,5000)
 
     def _update_stat(self):
-        if self.is_enabled: self.today_minutes += 1
         today_str = date.today().isoformat()
+        if getattr(self, "_stat_date", today_str) != today_str:
+            self.today_minutes = 0
+            self.break_count = 0
+            self.session_start = datetime.now()
+            self._stat_date = today_str
+        if self.is_enabled: self.today_minutes += 1
         self.week_data[today_str] = self.today_minutes
         self.sidebar_stat.setText(f"今日用眼\n{self.today_minutes} 分钟")
         self.sidebar_stat.setStyleSheet("color:#30363d;font-size:11px;padding:8px 18px;")
@@ -1085,6 +1118,7 @@ class CareEyesApp(QWidget):
         self.auto_mode = self.auto_toggle.isChecked()
         if self.auto_mode: self._auto_mode_tick()
         else: self.auto_status_lbl.setText("")
+        self._schedule_save()
 
     def _auto_mode_tick(self):
         if not self.auto_mode or not self.is_enabled: return
@@ -1105,11 +1139,13 @@ class CareEyesApp(QWidget):
             self._dim_mgr.show(self.super_dim_alpha)
         else:
             self._dim_mgr.hide()
+        self._schedule_save()
 
     def _on_dim_alpha(self, val):
         self.super_dim_alpha = val
         if self.super_dim:
             self._dim_mgr.set_alpha(val)
+        self._schedule_save()
 
     def _is_fullscreen(self) -> bool:
         """全屏检测：带进程名黑白名单，过滤伪全屏进程。(#4)"""
@@ -1153,7 +1189,15 @@ class CareEyesApp(QWidget):
             self._dim_mgr.rebuild()
 
     def _on_autostart_change(self, state):
-        self.autostart = bool(state); self._set_autostart(self.autostart)
+        self.autostart = bool(state); self._set_autostart(self.autostart); self._save_settings()
+
+    def _on_sound_toggle(self, state):
+        self.sound_enabled = bool(state)
+        self._schedule_save()
+
+    def _on_force_rest_toggle(self, state):
+        self.force_rest = bool(state)
+        self._schedule_save()
 
     def _set_autostart(self, enabled):
         path = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -1178,15 +1222,24 @@ class CareEyesApp(QWidget):
     def _reset_settings(self):
         self.temp=5000; self.bright=1.0
         self.rest_interval_min=45; self.rest_duration_sec=20
+        self.auto_mode=False; self.super_dim=False; self.super_dim_alpha=80
+        self.force_rest=False; self.sound_enabled=True
         self.temp_slider.setValue(5000); self.bright_slider.setValue(100)
         self.interval_spin.setValue(45); self.duration_spin.setValue(20)
+        self.auto_toggle.setChecked(False)
+        self.dim_toggle.setChecked(False); self.dim_slider.setValue(80); self.dim_slider.setEnabled(False)
+        self.force_rest_cb.setChecked(False); self.sound_cb.setChecked(True)
+        self._dim_mgr.hide()
+        self._next_rest_secs = self.rest_interval_min * 60
+        self._warned_1min = False
         self.apply_effect()
+        self._save_settings()
 
     # ══════════════════════════════════════════
     #  持久化
     # ══════════════════════════════════════════
     _DEFAULTS = {
-        "temp":5000,"bright":1.0,"rest_interval":45,"rest_duration":20,
+        "temp":5000,"bright":1.0,"is_enabled":True,"rest_interval":45,"rest_duration":20,
         "force_rest":False,
         "auto_mode":False,"autostart":False,"super_dim":False,"super_dim_alpha":80,
         "sound_enabled":True,"stat_date":"","today_minutes":0,"week_data":{},
@@ -1204,15 +1257,20 @@ class CareEyesApp(QWidget):
                     cfg[k] = v
             except Exception:
                 pass  # 文件损坏 → 静默使用默认值
-        self.temp=cfg["temp"]; self.bright=cfg["bright"]
-        self.rest_interval_min=cfg["rest_interval"]
-        self.rest_duration_sec=cfg["rest_duration"]
+        self.temp=max(2000, min(8000, int(cfg["temp"])))
+        self.bright=max(0.30, min(1.0, float(cfg["bright"])))
+        self.is_enabled=cfg["is_enabled"]
+        self.rest_interval_min=max(5, min(120, int(cfg["rest_interval"])))
+        self.rest_duration_sec=max(10, min(300, int(cfg["rest_duration"])))
         self.force_rest=cfg["force_rest"]
         self.auto_mode=cfg["auto_mode"]; self.super_dim=cfg["super_dim"]
-        self.super_dim_alpha=cfg["super_dim_alpha"]
-        self.sound_enabled=cfg["sound_enabled"]; self.week_data=cfg["week_data"]
+        self.super_dim_alpha=max(20, min(200, int(cfg["super_dim_alpha"])))
+        self.sound_enabled=cfg["sound_enabled"]
+        self.week_data={str(k): max(0, int(v)) for k,v in cfg["week_data"].items()
+                        if isinstance(k, str) and isinstance(v, (int, float))}
         self._next_rest_secs=self.rest_interval_min*60
         today=date.today().isoformat()
+        self._stat_date=today
         self.today_minutes=cfg["today_minutes"] if cfg["stat_date"]==today else 0
         self.autostart=self._read_autostart()
 
@@ -1220,7 +1278,7 @@ class CareEyesApp(QWidget):
         """原子写入：先写 .tmp 再 os.replace，防断电损坏。(#6)"""
         today=date.today().isoformat(); self.week_data[today]=self.today_minutes
         data={
-            "temp":self.temp,"bright":self.bright,
+            "temp":self.temp,"bright":self.bright,"is_enabled":self.is_enabled,
             "rest_interval":self.rest_interval_min,"rest_duration":self.rest_duration_sec,
             "force_rest":self.force_rest,
             "auto_mode":self.auto_mode,"super_dim":self.super_dim,
@@ -1236,7 +1294,19 @@ class CareEyesApp(QWidget):
             try: os.remove(tmp)
             except Exception: pass
 
+    def _schedule_save(self):
+        if not hasattr(self, "_save_timer"):
+            self._save_timer = QTimer(self)
+            self._save_timer.setSingleShot(True)
+            self._save_timer.timeout.connect(self._save_settings)
+        self._save_timer.start(500)
+
     def closeEvent(self, event):
+        if not self._quitting:
+            self._save_settings()
+            self.hide()
+            event.ignore()
+            return
         self._save_settings()
         self._dim_mgr.hide()
         DisplayManager.reset()
