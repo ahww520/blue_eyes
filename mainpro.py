@@ -1,21 +1,15 @@
 """
-CareEyes Pro v5.0
-商业级护眼工具 - 稳定性加固版
+CareEyes Pro v5.2
+轻量护眼工具 - 紧凑界面版
 
 依赖安装:
-    pip install PyQt5 pywin32 pynput
+    pip install PyQt5 pynput
 
-v5.0 新增/修复:
-  ✅ [#1]  守护频率提升至 800ms + WM_SETTINGCHANGE/WM_DISPLAYCHANGE 即时响应
-  ✅ [#2]  启动时权限检测，低权限时托盘警告
-  ✅ [#3]  多显示器热插拔监听 (screenCountChanged)，新屏立即补上护眼
-  ✅ [#4]  全屏检测黑白名单 (过滤 explorer/壁纸引擎等伪全屏进程)
-  ✅ [#5]  超暗模式多屏覆盖，每块屏幕独立 SuperDimOverlay 实例
-  ✅ [#6]  配置原子写入 (tmp → os.replace)，防断电损坏
-  ✅ [#7]  CPU 优化：is_enabled=False 时停守护；休息窗关闭时停球动画
-  ✅ [#8]  自启动路径双引号已确认，防空格 Bug
-  ✅ [#9]  强制休息模式：前10秒锁定跳过按钮
-  ✅ [#10] 系统主题色自适应：读注册表 Accent Color 动态替换主色调
+v5.2 新增/修复:
+  - 顶部紧凑导航替代宽侧边栏，减少界面占用
+  - 预设按钮和页面间距收紧，信息密度更高
+  - 去除未使用的 pywin32 依赖
+  - 增加精简 PyInstaller 构建配置和 Windows 版本信息
 """
 
 import sys
@@ -44,7 +38,7 @@ from PyQt5.QtGui import (
 # ─────────────────────────────────────────────
 APP_NAME    = "CareEyesPro"
 APP_TITLE   = "CareEyes Pro"
-APP_VER     = "v5.1"
+APP_VER     = "v5.2"
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".care_eyes_pro.json")
 
 # 全屏检测：这些进程名即便占全屏也不触发推迟（黑名单=不推迟）
@@ -619,17 +613,17 @@ class CareEyesApp(QWidget):
     # ══════════════════════════════════════════
     def init_ui(self):
         self.setWindowTitle(APP_TITLE)
-        self.setMinimumSize(720, 500)
-        self.resize(820, 560)
+        self.setMinimumSize(660, 460)
+        self.resize(700, 500)
         self.setStyleSheet(self._qss())
 
-        root = QHBoxLayout(self)
+        root = QVBoxLayout(self)
         root.setContentsMargins(0,0,0,0); root.setSpacing(0)
-        root.addWidget(self._build_sidebar())
+        root.addWidget(self._build_header())
         self.pages = QStackedWidget()
         for fn in [self._page_home, self._page_timer, self._page_stats, self._page_settings]:
             self.pages.addWidget(fn())
-        root.addWidget(self.pages)
+        root.addWidget(self.pages, 1)
 
     def _qss(self):
         ac = self._accent  # 系统强调色
@@ -645,7 +639,7 @@ class CareEyesApp(QWidget):
             margin:-6px 0; border-radius:8px; border:2px solid {ac}; }}
         QScrollBar:vertical {{ width:0; }}
         QSpinBox {{ background:#161b22; color:#c9d1d9; border:1px solid #30363d;
-            border-radius:6px; padding:4px 8px; min-width:70px; }}
+            border-radius:5px; padding:4px 8px; min-width:70px; }}
         QCheckBox {{ spacing:8px; }}
         QCheckBox::indicator {{ width:15px; height:15px; border-radius:4px;
             border:1px solid #30363d; background:#161b22; }}
@@ -654,7 +648,7 @@ class CareEyesApp(QWidget):
 
     def _card(self):
         f = QFrame()
-        f.setStyleSheet("background:#161b22;border-radius:12px;border:1px solid #21262d;")
+        f.setStyleSheet("background:#161b22;border-radius:8px;border:1px solid #21262d;")
         return f
 
     def _h2(self, t):
@@ -670,49 +664,47 @@ class CareEyesApp(QWidget):
         f.setStyleSheet("background:#21262d;max-height:1px;border:none;")
         return f
 
-    # ── 侧边栏 ──
-    def _build_sidebar(self):
-        sb = QFrame()
-        sb.setFixedWidth(205)
-        sb.setStyleSheet("background:#010409;border-right:1px solid #21262d;")
-        lay = QVBoxLayout(sb)
-        lay.setContentsMargins(0,26,0,14); lay.setSpacing(2)
+    # ── 顶部紧凑导航 ──
+    def _build_header(self):
+        header = QFrame()
+        header.setFixedHeight(58)
+        header.setStyleSheet("background:#010409;border-bottom:1px solid #21262d;")
+        lay = QHBoxLayout(header)
+        lay.setContentsMargins(18,0,14,0); lay.setSpacing(4)
 
-        brand = QLabel("◉  CareEyes Pro")
-        brand.setStyleSheet("color:#0ea5e9;font-size:15px;font-weight:700;"
-                            "padding-left:18px;margin-bottom:14px;letter-spacing:1px;")
+        brand = QLabel("◉  CareEyes")
+        brand.setStyleSheet("color:#0ea5e9;font-size:14px;font-weight:700;")
+        brand.setMinimumWidth(102)
         lay.addWidget(brand)
 
         self.nav_btns = []
-        for icon, label in [("○","护眼控制"),("□","休息提醒"),("≡","用眼统计"),("◈","设置")]:
-            btn = QPushButton(f"   {icon}   {label}")
-            btn.setCheckable(True); btn.setFixedHeight(44)
+        for label in ["护眼", "休息", "统计", "设置"]:
+            btn = QPushButton(label)
+            btn.setCheckable(True); btn.setFixedSize(66, 32)
             ac = self._accent
             btn.setStyleSheet(f"""
-                QPushButton {{ text-align:left;padding-left:14px;border:none;border-radius:0;
-                    color:#484f58;font-size:13px;background:transparent;
-                    border-left:2px solid transparent; }}
+                QPushButton {{ border:none;border-radius:6px;color:#6e7681;
+                    font-size:12px;background:transparent; }}
                 QPushButton:hover {{ color:#8b949e;background:rgba(255,255,255,0.03); }}
                 QPushButton:checked {{ color:{ac};background:rgba(14,165,233,0.07);
-                    border-left:2px solid {ac}; }}
+                    border:1px solid {ac}; }}
             """)
             btn.clicked.connect(lambda _,i=len(self.nav_btns): self._nav(i))
             self.nav_btns.append(btn); lay.addWidget(btn)
 
         self.nav_btns[0].setChecked(True)
         lay.addStretch()
-        self.sidebar_stat = QLabel("今日用眼\n— 分钟")
-        self.sidebar_stat.setStyleSheet("color:#21262d;font-size:11px;padding:8px 18px;")
-        self.sidebar_stat.setAlignment(Qt.AlignCenter)
-        lay.addWidget(self.sidebar_stat)
-        return sb
+        self.today_stat = QLabel("今日 — 分钟")
+        self.today_stat.setStyleSheet("color:#484f58;font-size:11px;")
+        lay.addWidget(self.today_stat)
+        return header
 
     # ══════════════════════════════════════════
     #  Page 0
     # ══════════════════════════════════════════
     def _page_home(self):
         page = QWidget(); lay = QVBoxLayout(page)
-        lay.setContentsMargins(28,24,28,24); lay.setSpacing(0)
+        lay.setContentsMargins(24,20,24,20); lay.setSpacing(0)
 
         top = QHBoxLayout()
         top.addWidget(self._h2("护眼控制")); top.addStretch()
@@ -741,13 +733,13 @@ class CareEyesApp(QWidget):
         mode_row = QHBoxLayout(); mode_row.setSpacing(6)
         self.mode_btns = {}
         for name, info in MODES.items():
-            btn = QPushButton(f"{info['icon']}\n{name}")
-            btn.setFixedHeight(56)
+            btn = QPushButton(f"{info['icon']}  {name}")
+            btn.setFixedHeight(40)
             btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             btn.setStyleSheet(self._mode_qss(False))
             btn.clicked.connect(lambda _,n=name: self.apply_preset(n))
             self.mode_btns[name] = btn; mode_row.addWidget(btn)
-        lay.addLayout(mode_row); lay.addSpacing(18)
+        lay.addLayout(mode_row); lay.addSpacing(14)
 
         # 滑条卡片
         card = self._card(); cl = QVBoxLayout(card)
@@ -810,7 +802,7 @@ class CareEyesApp(QWidget):
     # ══════════════════════════════════════════
     def _page_timer(self):
         page = QWidget(); lay = QVBoxLayout(page)
-        lay.setContentsMargins(28,24,28,24); lay.setSpacing(14)
+        lay.setContentsMargins(24,20,24,20); lay.setSpacing(12)
         lay.addWidget(self._h2("休息提醒"))
 
         card = self._card(); cl = QVBoxLayout(card)
@@ -818,7 +810,7 @@ class CareEyesApp(QWidget):
         cl.addWidget(self._caption("距下次休息"))
         self.next_rest_label = QLabel("45:00")
         self.next_rest_label.setStyleSheet(
-            "color:#0ea5e9;font-size:46px;font-weight:900;letter-spacing:3px;")
+            "color:#0ea5e9;font-size:40px;font-weight:900;")
         cl.addWidget(self.next_rest_label)
         self.fullscreen_warn = QLabel("")
         self.fullscreen_warn.setStyleSheet("color:#f97316;font-size:12px;")
@@ -858,7 +850,7 @@ class CareEyesApp(QWidget):
     # ══════════════════════════════════════════
     def _page_stats(self):
         page = QWidget(); lay = QVBoxLayout(page)
-        lay.setContentsMargins(28,24,28,24); lay.setSpacing(14)
+        lay.setContentsMargins(24,20,24,20); lay.setSpacing(12)
         lay.addWidget(self._h2("用眼统计"))
 
         cr = QHBoxLayout(); cr.setSpacing(10)
@@ -902,7 +894,7 @@ class CareEyesApp(QWidget):
     # ══════════════════════════════════════════
     def _page_settings(self):
         page = QWidget(); lay = QVBoxLayout(page)
-        lay.setContentsMargins(28,24,28,24); lay.setSpacing(14)
+        lay.setContentsMargins(24,20,24,20); lay.setSpacing(12)
         lay.addWidget(self._h2("设置"))
 
         card = self._card(); cl = QVBoxLayout(card)
@@ -1098,8 +1090,8 @@ class CareEyesApp(QWidget):
             self._stat_date = today_str
         if self.is_enabled: self.today_minutes += 1
         self.week_data[today_str] = self.today_minutes
-        self.sidebar_stat.setText(f"今日用眼\n{self.today_minutes} 分钟")
-        self.sidebar_stat.setStyleSheet("color:#30363d;font-size:11px;padding:8px 18px;")
+        self.today_stat.setText(f"今日 {self.today_minutes} 分钟")
+        self.today_stat.setStyleSheet("color:#6e7681;font-size:11px;")
 
     def _refresh_stats(self):
         sess = int((datetime.now()-self.session_start).total_seconds()/60)
