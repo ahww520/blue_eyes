@@ -5,6 +5,13 @@ CareEyes Pro v5.2
 依赖安装:
     pip install PyQt5 pynput
 
+桌面宠物（新增）:
+  - 纯 QPainter 绘制，无额外依赖；跟随护眼状态变表情
+  - 脚下细进度条显示距离下次休息的进度
+  - 戳一戳有反应、拖动贴边、位置记忆
+  - 右键菜单：打开主界面 / 立即休息 / 切换护眼 / 藏起来 / 退出
+  - 托盘和设置页均有开关，状态写入配置文件
+
 v5.2 新增/修复:
   - 顶部紧凑导航替代宽侧边栏，减少界面占用
   - 预设按钮和页面间距收紧，信息密度更高
@@ -30,7 +37,7 @@ from PyQt5.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve, QRect, pyqtSignal, QObject
 )
 from PyQt5.QtGui import (
-    QColor, QFont, QIcon, QPainter, QPen, QPixmap
+    QColor, QCursor, QFont, QFontMetrics, QIcon, QPainter, QPen, QPixmap
 )
 
 # ─────────────────────────────────────────────
@@ -493,6 +500,329 @@ class BarChart(QWidget):
 # ─────────────────────────────────────────────
 # 📱  主应用
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# 🐾  DesktopPet —— 护眼桌宠
+# ─────────────────────────────────────────────
+class DesktopPet(QWidget):
+    """纯 QPainter 绘制的桌面宠物，无额外依赖。
+
+    左键戳一下有反应，拖动移动并自动贴边；右键出菜单；
+    外观跟随主程序状态：正常 / 快到休息 / 休息中 / 护眼关闭。
+    """
+    W, H = 150, 168
+    BODY_TOP = 36
+
+    # state: (主体色, 高光色, 肚皮色)
+    PALETTE = {
+        "idle":    ("#0ea5e9", "#38bdf8", "#e0f2fe"),
+        "tired":   ("#f59e0b", "#fbbf24", "#fef3c7"),
+        "resting": ("#6366f1", "#818cf8", "#e0e7ff"),
+        "off":     ("#475569", "#64748b", "#e2e8f0"),
+    }
+
+    TIPS = {
+        "idle":    ["今天也要好好护眼", "记得多眨眨眼", "坐直一点，别驼背",
+                    "喝口水吧", "我在这儿陪着你", "看看远处，放松一下"],
+        "tired":   ["快到休息时间啦", "眼睛有点酸了呢"],
+        "resting": ["闭上眼睛，放松一会儿", "看看窗外的远处"],
+        "off":     ["护眼已关闭，别熬太久"],
+    }
+
+    def __init__(self, open_app=None, hide_pet=None, quit_app=None,
+                 rest_now=None, toggle_care=None, on_moved=None):
+        super().__init__(None)
+        self._open_app    = open_app
+        self._hide_pet    = hide_pet
+        self._quit_app    = quit_app
+        self._rest_now    = rest_now
+        self._toggle_care = toggle_care
+        self._on_moved    = on_moved
+
+        self._state = "idle"
+        self._phase = 0.0
+        self._blink = 0             # 剩余眨眼帧
+        self._next_blink = 40
+        self._squash = 0.0          # 被戳时的挤压动画
+        self._drag_from = None
+        self._dragged = False
+        self._msg = ""
+        self._tip_idx = 0
+        self._left_secs = 0
+        self._total_secs = 0
+        self._look = (0.0, 0.0)     # 眼球偏移
+
+        self.setFixedSize(self.W, self.H)
+        self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint |
+                            Qt.WindowStaysOnTopHint | Qt.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_NoSystemBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("左键戳一下 · 拖动移动 · 右键菜单")
+
+        self._anim_timer = QTimer(self)
+        self._anim_timer.timeout.connect(self._tick)
+        self._anim_timer.start(60)
+        self._msg_timer = QTimer(self)
+        self._msg_timer.setSingleShot(True)
+        self._msg_timer.timeout.connect(self._clear_msg)
+        self._chat_timer = QTimer(self)          # 偶尔自己冒个泡
+        self._chat_timer.timeout.connect(self._auto_chat)
+        self._chat_timer.start(120_000)
+
+    # ── 位置 ──────────────────────────────────
+    def place(self, pos=None):
+        """恢复上次的位置；没有记录或已越界则贴到右下角。"""
+        if pos and len(pos) == 2 and self._on_any_screen(pos[0], pos[1]):
+            self.move(int(pos[0]), int(pos[1]))
+            return
+        scr = QApplication.primaryScreen()
+        if scr:
+            a = scr.availableGeometry()
+            self.move(a.right() - self.width() - 24, a.bottom() - self.height() - 8)
+
+    @staticmethod
+    def _on_any_screen(x, y) -> bool:
+        probe = QRect(int(x), int(y), 48, 48)
+        return any(s.availableGeometry().intersects(probe)
+                   for s in QApplication.screens())
+
+    def keep_on_screen(self):
+        """显示器热插拔后把桌宠拉回可见区域。"""
+        if not self._on_any_screen(self.x(), self.y()):
+            self.place(None)
+
+    def _snap_edge(self):
+        """拖动结束后限制在屏幕内，靠近左右边缘时自动贴边。"""
+        scr = QApplication.screenAt(self.geometry().center()) or QApplication.primaryScreen()
+        if not scr:
+            return
+        a = scr.availableGeometry()
+        x = min(max(self.x(), a.left()), a.right() - self.width())
+        y = min(max(self.y(), a.top()), a.bottom() - self.height())
+        if x - a.left() < 32:
+            x = a.left()
+        elif a.right() - (x + self.width()) < 32:
+            x = a.right() - self.width()
+        self.move(x, y)
+
+    # ── 与主程序联动 ──────────────────────────
+    def set_state(self, state: str):
+        if state not in self.PALETTE or state == self._state:
+            return
+        self._state = state
+        if state != "idle":
+            self.say(self.TIPS[state][0], 5000)
+        self.update()
+
+    def set_countdown(self, left_secs: int, total_secs: int):
+        self._left_secs = max(0, int(left_secs))
+        self._total_secs = max(0, int(total_secs))
+        m, s = divmod(self._left_secs, 60)
+        self.setToolTip(f"距离下次休息 {m:02d}:{s:02d}\n"
+                        f"左键戳一下 · 拖动移动 · 右键菜单")
+        if self._total_secs:
+            self.update()
+
+    def say(self, text: str, ms: int = 3200):
+        self._msg = text
+        self._msg_timer.start(ms)
+        self.update()
+
+    def _clear_msg(self):
+        self._msg = ""
+        self.update()
+
+    def _auto_chat(self):
+        tips = self.TIPS.get(self._state, self.TIPS["idle"])
+        self._tip_idx = (self._tip_idx + 1) % len(tips)
+        self.say(tips[self._tip_idx])
+
+    # ── 动画 ──────────────────────────────────
+    def _tick(self):
+        self._phase += 0.09
+        if self._squash > 0:
+            self._squash = max(0.0, self._squash - 0.1)
+        if self._blink > 0:
+            self._blink -= 1
+        else:
+            self._next_blink -= 1
+            if self._next_blink <= 0:
+                self._blink = 4
+                self._next_blink = 45 + int(abs(math.sin(self._phase * 3)) * 45)
+        # 眼球追随鼠标
+        d = QCursor.pos() - self.geometry().center()
+        self._look = (max(-3.0, min(3.0, d.x() / 55)),
+                      max(-2.5, min(2.5, d.y() / 75)))
+        self.update()
+
+    # ── 绘制 ──────────────────────────────────
+    def paintEvent(self, event):
+        body, light, belly = self.PALETTE[self._state]
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        bob = math.sin(self._phase) * 3.0 + self._squash * 5
+        top = self.BODY_TOP + bob
+        p.setPen(Qt.NoPen)
+
+        # 影子：跳得越高越小
+        sw = 92 - int(bob * 2)
+        p.setBrush(QColor(0, 0, 0, 70))
+        p.drawEllipse(int(self.W / 2 - sw / 2), 142, sw, 12)
+
+        # 尾巴（左右摆动）
+        wag = math.sin(self._phase * 1.7) * 9
+        p.setBrush(QColor(body))
+        p.drawEllipse(int(106 + wag * 0.5), int(top + 60), 28, 13)
+
+        # 耳朵
+        p.setBrush(QColor(light))
+        p.drawEllipse(25, int(top - 4), 30, 34)
+        p.drawEllipse(95, int(top - 4), 30, 34)
+        p.setBrush(QColor(belly))
+        p.drawEllipse(33, int(top + 5), 13, 17)
+        p.drawEllipse(103, int(top + 5), 13, 17)
+
+        # 身体 + 肚皮 + 脚
+        p.setBrush(QColor(body))
+        p.drawRoundedRect(QRect(28, int(top + 8), 94, 90), 34, 34)
+        p.setBrush(QColor(belly))
+        p.drawEllipse(39, int(top + 22), 72, 62)
+        p.setBrush(QColor(body).darker(112))
+        p.drawEllipse(38, int(top + 84), 28, 15)
+        p.drawEllipse(84, int(top + 84), 28, 15)
+
+        self._paint_face(p, top)
+        self._paint_bar(p)
+        self._paint_bubble(p)
+
+    def _paint_face(self, p, top):
+        ink = QColor("#0f172a")
+        ex, ey = self._look
+        eye_y = top + 36
+        if self._blink > 0 or self._state == "resting":
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(ink, 3, Qt.SolidLine, Qt.RoundCap))
+            p.drawArc(50, int(eye_y + 4), 16, 12, 0, -180 * 16)
+            p.drawArc(85, int(eye_y + 4), 16, 12, 0, -180 * 16)
+        else:
+            eh = 11 if self._state == "tired" else 17
+            for cx in (50, 88):
+                p.setPen(Qt.NoPen); p.setBrush(ink)
+                p.drawEllipse(int(cx + ex), int(eye_y + ey), 13, eh)
+                p.setBrush(QColor(255, 255, 255, 230))
+                p.drawEllipse(int(cx + 3 + ex), int(eye_y + 3 + ey), 4, 5)
+            if self._state == "tired":              # 半睁的上眼皮
+                p.setBrush(Qt.NoBrush)
+                p.setPen(QPen(ink, 3, Qt.SolidLine, Qt.RoundCap))
+                p.drawLine(50, int(eye_y - 1), 63, int(eye_y - 2))
+                p.drawLine(88, int(eye_y - 2), 101, int(eye_y - 1))
+        # 腮红
+        p.setPen(Qt.NoPen); p.setBrush(QColor(251, 113, 133, 140))
+        p.drawEllipse(41, int(eye_y + 20), 13, 8)
+        p.drawEllipse(96, int(eye_y + 20), 13, 8)
+        # 嘴，休息时再冒两个 z
+        p.setBrush(Qt.NoBrush); p.setPen(QPen(ink, 2, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(68, int(eye_y + 18), 16, 12, 200 * 16, 140 * 16)
+        if self._state == "resting":
+            zf = QFont("Segoe UI"); zf.setPixelSize(13); zf.setBold(True)
+            p.setFont(zf)
+            p.setPen(QColor("#c7d2fe"))
+            p.drawText(112, int(eye_y - 4 + math.sin(self._phase) * 2), "z")
+            p.drawText(122, int(eye_y - 16 + math.sin(self._phase + 1.2) * 2), "z")
+
+    def _paint_bar(self, p):
+        """脚下的细进度条：距离下次休息的进度。"""
+        if self._state == "off" or self._total_secs <= 0:
+            return
+        done = 1 - self._left_secs / self._total_secs
+        bar = QRect(33, 157, 84, 5)
+        p.setPen(Qt.NoPen); p.setBrush(QColor(255, 255, 255, 45))
+        p.drawRoundedRect(bar, 3, 3)
+        p.setBrush(QColor("#f59e0b") if self._left_secs <= 60 else QColor("#38bdf8"))
+        p.drawRoundedRect(QRect(bar.x(), bar.y(),
+                                max(4, int(bar.width() * max(0.0, min(1.0, done)))),
+                                bar.height()), 3, 3)
+
+    def _paint_bubble(self, p):
+        if not self._msg:
+            return
+        box = QRect(2, 0, self.W - 4, 30)
+        p.setBrush(QColor(1, 4, 9, 235)); p.setPen(QPen(QColor("#38bdf8"), 1))
+        p.drawRoundedRect(box.adjusted(0, 1, 0, -2), 8, 8)
+        # 用像素字号，避免不同 DPI 下文字撑破气泡
+        f = QFont("Microsoft YaHei"); f.setPixelSize(12)
+        p.setFont(f); p.setPen(QColor("#dbeafe"))
+        inner = box.adjusted(6, 0, -6, -1)
+        p.drawText(inner, Qt.AlignCenter,
+                   QFontMetrics(f).elidedText(self._msg, Qt.ElideRight, inner.width()))
+
+    # ── 交互 ──────────────────────────────────
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_from = event.globalPos() - self.frameGeometry().topLeft()
+            self._dragged = False
+            event.accept()
+        elif event.button() == Qt.RightButton:
+            self._show_menu(event.globalPos())
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_from is not None and event.buttons() & Qt.LeftButton:
+            self.move(event.globalPos() - self._drag_from)
+            self._dragged = True
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._drag_from is not None:
+            self._drag_from = None
+            if self._dragged:
+                self._snap_edge()
+                if self._on_moved:
+                    self._on_moved(self.x(), self.y())
+            else:
+                self._poke()          # 只是戳了一下
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton and self._open_app:
+            self._open_app()
+        super().mouseDoubleClickEvent(event)
+
+    def enterEvent(self, event):
+        if self._total_secs and self._state != "off":
+            m, s = divmod(self._left_secs, 60)
+            self.say(f"距离休息还有 {m:02d}:{s:02d}", 2500)
+        super().enterEvent(event)
+
+    def _poke(self):
+        self._squash = 1.0
+        self._blink = 4
+        self._auto_chat()
+
+    def _show_menu(self, pos):
+        menu = QMenu(self)
+        menu.setStyleSheet("QMenu{background:#161b22;color:#c9d1d9;"
+                           "border:1px solid #30363d;padding:4px;}"
+                           "QMenu::item{padding:5px 24px 5px 14px;}"
+                           "QMenu::item:selected{background:#21262d;}")
+        acts = {}
+        for label, cb in [("打开主界面", self._open_app),
+                          ("立即休息一下", self._rest_now),
+                          ("切换护眼", self._toggle_care),
+                          (None, None),
+                          ("藏起来", self._hide_pet),
+                          ("退出程序", self._quit_app)]:
+            if label is None:
+                menu.addSeparator(); continue
+            act = menu.addAction(label)
+            act.setEnabled(cb is not None)
+            acts[act] = cb
+        cb = acts.get(menu.exec_(pos))
+        if cb:
+            cb()
+
+
 class CareEyesApp(QWidget):
     hotkey_brightness = pyqtSignal(int)
     hotkey_temperature = pyqtSignal(int)
@@ -502,6 +832,7 @@ class CareEyesApp(QWidget):
         super().__init__()
         self._quitting = False
         self.overlay = None
+        self.pet = None
         # ── 读取系统主题色 (#10) ──
         self._accent = _read_system_accent()
 
@@ -512,6 +843,8 @@ class CareEyesApp(QWidget):
         self.rest_interval_min = 45; self.rest_duration_sec = 20
         self.force_rest = False          # #9 强制休息
         self.autostart = False; self.sound_enabled = True
+        self.pet_enabled = True
+        self.pet_pos = None
         self.session_start = datetime.now()
         self.today_minutes = 0; self.break_count = 0
         self.week_data = {}
@@ -527,6 +860,7 @@ class CareEyesApp(QWidget):
         self.load_settings()
         self.init_ui()
         self.init_tray()
+        self.init_pet()
         self.init_timers()
         self.init_hotkeys()
         self.apply_effect()
@@ -570,6 +904,76 @@ class CareEyesApp(QWidget):
             QApplication.instance().screenRemoved.connect(self._on_screen_change)
         except Exception:
             pass
+
+    # ══════════════════════════════════════════
+    #  桌宠
+    # ══════════════════════════════════════════
+    def init_pet(self):
+        self.pet = DesktopPet(
+            open_app=self._open_main,
+            hide_pet=lambda: self._on_pet_toggle(False),
+            quit_app=self._quit_app,
+            rest_now=self.show_rest_overlay,
+            toggle_care=self._hk_toggle,
+            on_moved=self._on_pet_moved,
+        )
+        self.pet.setVisible(False)
+        self.pet.set_countdown(self._next_rest_secs, self.rest_interval_min * 60)
+        if not self.is_enabled:
+            self.pet.set_state("off")
+        if self.pet_enabled:
+            self._show_pet()
+
+    def _show_pet(self):
+        if self.pet is None:
+            return
+        if not self.pet.isVisible():
+            self.pet.place(self.pet_pos)
+            self.pet.show()
+        self.pet.raise_()
+
+    def _hide_pet(self):
+        if self.pet is not None:
+            self.pet.hide()
+
+    def _open_main(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _on_pet_moved(self, x, y):
+        self.pet_pos = [int(x), int(y)]
+        self._schedule_save()
+
+    def _pet_state(self):
+        """根据当前护眼/休息状态推导桌宠表情。"""
+        if self.pet is None:
+            return
+        if not self.is_enabled:
+            state = "off"
+        elif self.overlay is not None and self.overlay.isVisible():
+            state = "resting"
+        elif self._next_rest_secs <= 60:
+            state = "tired"
+        else:
+            state = "idle"
+        self.pet.set_state(state)
+
+    def _on_pet_toggle(self, state):
+        self.pet_enabled = bool(state)
+        if self.pet_enabled:
+            self._show_pet()
+        else:
+            self._hide_pet()
+        if hasattr(self, "pet_action"):
+            self.pet_action.blockSignals(True)
+            self.pet_action.setChecked(self.pet_enabled)
+            self.pet_action.blockSignals(False)
+        if hasattr(self, "pet_cb"):
+            self.pet_cb.blockSignals(True)
+            self.pet_cb.setChecked(self.pet_enabled)
+            self.pet_cb.blockSignals(False)
+        self._schedule_save()
 
     # ══════════════════════════════════════════
     def init_hotkeys(self):
@@ -903,6 +1307,7 @@ class CareEyesApp(QWidget):
         for row_lbl, attr, default in [
             ("开机自动启动","autostart_cb",self.autostart),
             ("声音提示",   "sound_cb",    self.sound_enabled),
+            ("桌面宠物",   "pet_cb",      self.pet_enabled),
             ("强制休息（前10秒锁定跳过）","force_rest_cb", self.force_rest),
         ]:
             row = QHBoxLayout(); row.addWidget(QLabel(row_lbl))
@@ -912,6 +1317,7 @@ class CareEyesApp(QWidget):
 
         self.autostart_cb.stateChanged.connect(self._on_autostart_change)
         self.sound_cb.stateChanged.connect(self._on_sound_toggle)
+        self.pet_cb.stateChanged.connect(self._on_pet_toggle)
         self.force_rest_cb.stateChanged.connect(self._on_force_rest_toggle)
 
         hk = QLabel("全局快捷键\n"
@@ -953,20 +1359,27 @@ class CareEyesApp(QWidget):
         menu = QMenu()
         menu.setStyleSheet("QMenu{background:#161b22;color:#c9d1d9;border:1px solid #30363d;padding:4px;}"
                            "QMenu::item:selected{background:#21262d;}")
-        for label,slot in [("显示主界面",self.show),("切换护眼",self._hk_toggle),
+        for label,slot in [("显示主界面",self._open_main),("切换护眼",self._hk_toggle),
                             (None,None),("退出",self._quit_app)]:
             if label is None: menu.addSeparator()
             else:
                 a=QAction(label,self); a.triggered.connect(slot); menu.addAction(a)
+        # 桌宠开关（与设置页复选框同步）
+        self.pet_action = QAction("显示桌宠", self, checkable=True)
+        self.pet_action.setChecked(self.pet_enabled)
+        self.pet_action.toggled.connect(self._on_pet_toggle)
+        menu.insertAction(menu.actions()[2], self.pet_action)
         self.tray.setContextMenu(menu)
         self.tray.setToolTip(f"{APP_TITLE} — 运行中")
-        self.tray.activated.connect(lambda r: self.show() if r==QSystemTrayIcon.DoubleClick else None)
+        self.tray.activated.connect(lambda r: self._open_main() if r==QSystemTrayIcon.DoubleClick else None)
         self.tray.show()
 
     def _quit_app(self):
         self._quitting = True
         self._save_settings()
         self._dim_mgr.hide()
+        if self.pet is not None:
+            self.pet.close()
         if hasattr(self, "_hk_listener"):
             self._hk_listener.stop()
         DisplayManager.reset()
@@ -1034,6 +1447,7 @@ class CareEyesApp(QWidget):
             self._transition.stop()
             self.guard_timer.stop()               # #7 停止守护节省 CPU
             DisplayManager.reset()
+        self._pet_state()
         self._save_settings()
 
     def apply_effect(self):
@@ -1071,15 +1485,24 @@ class CareEyesApp(QWidget):
         self.overlay.show()
         self._next_rest_secs = self.rest_interval_min * 60
         self._warned_1min = False; self.break_count += 1
+        if self.pet is not None:
+            self.pet.set_countdown(self._next_rest_secs, self.rest_interval_min * 60)
+            self.pet.set_state("resting")
 
     def _refresh_countdown(self):
         self._next_rest_secs = max(0, self._next_rest_secs-1)
         m = self._next_rest_secs//60; s = self._next_rest_secs%60
         self.next_rest_label.setText(f"{m:02d}:{s:02d}")
+        if self.pet is not None:
+            self.pet.set_countdown(self._next_rest_secs,
+                                   self.rest_interval_min*60)
+            self._pet_state()
         if self._next_rest_secs == 60 and not self._warned_1min:
             self._warned_1min = True
             self.tray.showMessage(APP_TITLE,"还有 1 分钟就该休息了 ☕",
                                   QSystemTrayIcon.Information,5000)
+            if self.pet is not None:
+                self.pet.say("还有 1 分钟就休息啦", 6000)
 
     def _update_stat(self):
         today_str = date.today().isoformat()
@@ -1179,6 +1602,8 @@ class CareEyesApp(QWidget):
         self.apply_effect()
         if self.super_dim:
             self._dim_mgr.rebuild()
+        if self.pet is not None and self.pet.isVisible():
+            self.pet.keep_on_screen()
 
     def _on_autostart_change(self, state):
         self.autostart = bool(state); self._set_autostart(self.autostart); self._save_settings()
@@ -1224,6 +1649,8 @@ class CareEyesApp(QWidget):
         self._dim_mgr.hide()
         self._next_rest_secs = self.rest_interval_min * 60
         self._warned_1min = False
+        self.pet_pos = None                 # 桌宠回到右下角默认位置
+        self._hide_pet(); self._on_pet_toggle(True)
         self.apply_effect()
         self._save_settings()
 
@@ -1235,6 +1662,7 @@ class CareEyesApp(QWidget):
         "force_rest":False,
         "auto_mode":False,"autostart":False,"super_dim":False,"super_dim_alpha":80,
         "sound_enabled":True,"stat_date":"","today_minutes":0,"week_data":{},
+        "pet_enabled":True,"pet_pos":[],
     }
 
     def load_settings(self):
@@ -1258,6 +1686,11 @@ class CareEyesApp(QWidget):
         self.auto_mode=cfg["auto_mode"]; self.super_dim=cfg["super_dim"]
         self.super_dim_alpha=max(20, min(200, int(cfg["super_dim_alpha"])))
         self.sound_enabled=cfg["sound_enabled"]
+        self.pet_enabled=cfg["pet_enabled"]
+        pos=cfg["pet_pos"]
+        self.pet_pos=([int(pos[0]), int(pos[1])]
+                      if len(pos)==2 and all(isinstance(v,(int,float)) for v in pos)
+                      else None)
         self.week_data={str(k): max(0, int(v)) for k,v in cfg["week_data"].items()
                         if isinstance(k, str) and isinstance(v, (int, float))}
         self._next_rest_secs=self.rest_interval_min*60
@@ -1276,6 +1709,7 @@ class CareEyesApp(QWidget):
             "auto_mode":self.auto_mode,"super_dim":self.super_dim,
             "super_dim_alpha":self.super_dim_alpha,"sound_enabled":self.sound_enabled,
             "stat_date":today,"today_minutes":self.today_minutes,"week_data":self.week_data,
+            "pet_enabled":self.pet_enabled,"pet_pos":self.pet_pos or [],
         }
         tmp = CONFIG_FILE + ".tmp"
         try:
@@ -1301,6 +1735,8 @@ class CareEyesApp(QWidget):
             return
         self._save_settings()
         self._dim_mgr.hide()
+        if self.pet is not None:
+            self.pet.close()
         DisplayManager.reset()
         super().closeEvent(event)
 
