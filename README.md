@@ -48,6 +48,7 @@
 - 已休息次数
 - 今日用眼目标进度（圆环，480 分钟为上限）
 - 近 7 天用眼时长柱状图
+- 统计数据保留最近 31 天，跨午夜自动归档
 
 ### 🐾 桌面宠物
 | 功能 | 说明 |
@@ -92,6 +93,12 @@ python mainpro.py
 ```
 
 > **提示**：若护眼效果对某些以管理员权限运行的程序（如游戏）无效，请右键 → 以管理员身份运行。
+
+### 运行回归检查
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ### 打包为独立 .exe（可选）
 
@@ -138,6 +145,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 - 数据按自然日归零，每天独立记录
 - 近 7 天柱状图，今日数据高亮显示
+- 同页显示 CPU、内存、系统盘占用率和系统运行时间；Windows 性能接口不可用时自动降级
 
 > 上图为示例数据。
 
@@ -148,7 +156,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 | 选项 | 说明 |
 |------|------|
 | 开机自动启动 | 勾选后写入注册表，取消勾选后自动删除 |
-| 声音提示 | 控制休息提醒时的系统提示音（预留开关） |
+| 声音提示 | 控制休息提醒时的系统提示音 |
 | 桌面宠物 | 显示/隐藏桌宠，与托盘菜单的「显示桌宠」双向同步 |
 | 强制休息 | 休息窗口前 10 秒禁止跳过 |
 
@@ -195,6 +203,7 @@ C:\Users\<你的用户名>\.care_eyes_pro.json
   "sound_enabled": true,
   "stat_date": "2025-08-01",
   "today_minutes": 132,
+  "break_count": 3,
   "week_data": {
     "2025-07-26": 310,
     "2025-07-27": 420
@@ -213,6 +222,7 @@ mainpro.py
 │
 ├── _read_system_accent()     读取 Windows 强调色（注册表）
 ├── _is_admin()               检测当前进程权限
+├── SystemMetricsCollector    采集 CPU、内存、磁盘和系统运行时间
 │
 ├── DisplayManager            多显示器 Gamma 控制
 │   ├── _kelvin_to_rgb()      色温 → RGB 比例（Tanner Helland 算法）
@@ -233,7 +243,7 @@ mainpro.py
 ├── BarChart                  自绘7天柱状图
 │
 └── CareEyesApp               主窗口
-    ├── init_timers()         守护(800ms) / 统计(1min) / 倒计时(1s) / 自动模式(1min)
+    ├── init_timers()         守护(800ms) / 统计(1min) / 倒计时(1s) / 自动模式(1min) / 系统状态(2s)
     ├── init_hotkeys()        pynput 全局键盘监听（后台线程）
     ├── nativeEvent()         WM_SETTINGCHANGE / WM_DISPLAYCHANGE / WM_POWERBROADCAST
     ├── _is_fullscreen()      进程名黑白名单 + 窗口尺寸双重判断

@@ -20,6 +20,9 @@ if (-not (Test-Path -LiteralPath $exe)) {
 
 $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $exe
 $sizeMb = [math]::Round((Get-Item -LiteralPath $exe).Length / 1MB, 2)
+$hashFile = Join-Path $projectDir "CareEyesPro.exe.sha256"
+"$($hash.Hash)  CareEyesPro.exe" | Set-Content -LiteralPath $hashFile -Encoding ascii
 Write-Host "构建完成：$exe"
 Write-Host "文件大小：$sizeMb MB"
 Write-Host "SHA256：$($hash.Hash)"
+Write-Host "SHA256 文件已更新：$hashFile"

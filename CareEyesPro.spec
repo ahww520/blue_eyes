@@ -44,6 +44,9 @@ a = Analysis(
         "numpy",
         "pytest",
         "setuptools",
+        # PyQt5 >= 5.11 bundles SIP as PyQt5.sip; the legacy top-level
+        # module only causes a harmless PyInstaller hook warning.
+        "sip",
         "tkinter",
         "unittest",
     ],

@@ -25,16 +25,21 @@ import ctypes.wintypes
 import math
 import json
 import os
-import winreg
+import shutil
+try:
+    import winreg
+except ImportError:  # 允许在非 Windows 环境运行纯逻辑检查
+    winreg = None
+from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QLabel,
     QSlider, QHBoxLayout, QFrame, QStackedWidget, QSpinBox,
     QSystemTrayIcon, QMenu, QAction, QCheckBox, QGraphicsDropShadowEffect,
-    QSizePolicy
+    QSizePolicy, QGridLayout, QProgressBar
 )
 from PyQt5.QtCore import (
-    Qt, QTimer, QPropertyAnimation, QEasingCurve, QRect, pyqtSignal, QObject
+    Qt, QTimer, QRect, pyqtSignal, QObject
 )
 from PyQt5.QtGui import (
     QColor, QCursor, QFont, QFontMetrics, QIcon, QPainter, QPen, QPixmap
@@ -81,14 +86,15 @@ AUTO_CURVE = {
 # ─────────────────────────────────────────────
 def _read_system_accent() -> str:
     """读取 Windows 系统强调色，返回 #RRGGBB，失败时返回默认蓝。"""
+    if winreg is None:
+        return "#0ea5e9"
     try:
-        key = winreg.OpenKey(
+        with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER,
             r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent"
-        )
+        ) as key:
         # AccentColorMenu 是 ABGR 格式的 DWORD
-        val, _ = winreg.QueryValueEx(key, "AccentColorMenu")
-        winreg.CloseKey(key)
+            val, _ = winreg.QueryValueEx(key, "AccentColorMenu")
         b = (val >> 16) & 0xFF
         g = (val >>  8) & 0xFF
         r =  val        & 0xFF
@@ -110,9 +116,285 @@ def _is_admin() -> bool:
         return False
 
 
+def _format_bytes(value) -> str:
+    """将字节数格式化成紧凑的用户可读文本。"""
+    if value is None:
+        return "—"
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if not math.isfinite(value) or value < 0:
+        return "—"
+    units = ("B", "KB", "MB", "GB", "TB")
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return "—"
+
+
+def _format_uptime(seconds) -> str:
+    """将系统运行秒数格式化为天/时/分，避免状态卡片被撑宽。"""
+    if seconds is None:
+        return "—"
+    try:
+        seconds = max(0, int(seconds))
+    except (TypeError, ValueError):
+        return "—"
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    if days:
+        return f"{days}天 {hours:02d}时"
+    if hours:
+        return f"{hours}时 {minutes:02d}分"
+    return f"{minutes}分"
+
+
+def _percent(value, total=None):
+    """返回 0..100 的百分比；输入不完整时返回 None。"""
+    if total is not None:
+        try:
+            if total <= 0:
+                return None
+            value = float(value) / float(total) * 100
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+    try:
+        value = float(value)
+        if not math.isfinite(value):
+            return None
+        return max(0.0, min(100.0, value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _bounded_int(value, default, low=None, high=None):
+    """将外部配置安全转换为整数，拒绝 bool/NaN/无穷值。"""
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise ValueError
+        result = int(numeric)
+    except (TypeError, ValueError, OverflowError):
+        result = int(default)
+    if low is not None:
+        result = max(int(low), result)
+    if high is not None:
+        result = min(int(high), result)
+    return result
+
+
+def _bounded_float(value, default, low=None, high=None):
+    """将外部配置安全转换为有限浮点数并限制范围。"""
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError
+    except (TypeError, ValueError, OverflowError):
+        result = float(default)
+    if low is not None:
+        result = max(float(low), result)
+    if high is not None:
+        result = min(float(high), result)
+    return result
+
+
+def _parse_position(value):
+    """解析桌宠位置；损坏或非有限坐标直接回退默认位置。"""
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    try:
+        coords = [float(v) for v in value]
+        if not all(math.isfinite(v) for v in coords):
+            return None
+        return [int(coords[0]), int(coords[1])]
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+class _FILETIME(ctypes.Structure):
+    _fields_ = [
+        ("dwLowDateTime", ctypes.wintypes.DWORD),
+        ("dwHighDateTime", ctypes.wintypes.DWORD),
+    ]
+
+
+class _MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", ctypes.wintypes.DWORD),
+        ("dwMemoryLoad", ctypes.wintypes.DWORD),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
+
+
+@dataclass
+class SystemSnapshot:
+    cpu_state: str = "unavailable"
+    cpu_percent: float = None
+    memory_used: int = None
+    memory_total: int = None
+    uptime_seconds: int = None
+
+
+@dataclass
+class DiskSnapshot:
+    root: str
+    used: int = None
+    total: int = None
+    free: int = None
+
+
+class SystemMetricsCollector:
+    """使用 WinAPI 和标准库读取轻量系统状态。"""
+
+    def __init__(self):
+        self._kernel32 = None
+        self._previous_cpu = None
+        try:
+            self._kernel32 = ctypes.windll.kernel32
+            self._kernel32.GetSystemTimes.argtypes = [
+                ctypes.POINTER(_FILETIME),
+                ctypes.POINTER(_FILETIME),
+                ctypes.POINTER(_FILETIME),
+            ]
+            self._kernel32.GetSystemTimes.restype = ctypes.wintypes.BOOL
+            self._kernel32.GlobalMemoryStatusEx.argtypes = [
+                ctypes.POINTER(_MEMORYSTATUSEX)
+            ]
+            self._kernel32.GlobalMemoryStatusEx.restype = ctypes.wintypes.BOOL
+            self._kernel32.GetTickCount64.argtypes = []
+            self._kernel32.GetTickCount64.restype = ctypes.c_ulonglong
+        except Exception:
+            # 统计页仍可显示磁盘信息，CPU/内存/运行时间降级为不可用。
+            self._kernel32 = None
+
+    @property
+    def available(self):
+        return self._kernel32 is not None
+
+    @staticmethod
+    def _filetime_value(value):
+        return (value.dwHighDateTime << 32) | value.dwLowDateTime
+
+    def reset_cpu_baseline(self):
+        self._previous_cpu = None
+
+    def _read_system_times(self):
+        if self._kernel32 is None:
+            raise OSError("Windows performance API unavailable")
+        idle = _FILETIME()
+        kernel = _FILETIME()
+        user = _FILETIME()
+        if not self._kernel32.GetSystemTimes(
+                ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
+            raise ctypes.WinError()
+        return tuple(self._filetime_value(v) for v in (idle, kernel, user))
+
+    @staticmethod
+    def _calculate_cpu_percent(previous, current):
+        if not previous or not current or len(previous) != 3 or len(current) != 3:
+            return None
+        try:
+            deltas = tuple(now - old for old, now in zip(previous, current))
+        except TypeError:
+            return None
+        idle_delta, kernel_delta, user_delta = deltas
+        total_delta = kernel_delta + user_delta
+        if any(delta < 0 for delta in deltas) or total_delta <= 0:
+            return None
+        busy_delta = total_delta - idle_delta
+        return _percent(busy_delta / total_delta * 100.0)
+
+    def _sample_cpu(self):
+        try:
+            current = self._read_system_times()
+        except Exception:
+            self.reset_cpu_baseline()
+            return "unavailable", None
+        previous = self._previous_cpu
+        self._previous_cpu = current
+        if previous is None:
+            return "warming", None
+        percent = self._calculate_cpu_percent(previous, current)
+        if percent is None:
+            return "warming", None
+        return "ready", percent
+
+    def _sample_memory(self):
+        try:
+            if self._kernel32 is None:
+                raise OSError("Windows performance API unavailable")
+            status = _MEMORYSTATUSEX()
+            status.dwLength = ctypes.sizeof(status)
+            if not self._kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                raise ctypes.WinError()
+            total = int(status.ullTotalPhys)
+            available = int(status.ullAvailPhys)
+            if total <= 0:
+                raise ValueError("invalid physical memory total")
+            return max(0, total - available), total
+        except Exception:
+            return None, None
+
+    def _sample_uptime(self):
+        try:
+            if self._kernel32 is None:
+                raise OSError("Windows performance API unavailable")
+            return int(self._kernel32.GetTickCount64() // 1000)
+        except Exception:
+            return None
+
+    def sample_fast(self):
+        cpu_state, cpu_percent = self._sample_cpu()
+        memory_used, memory_total = self._sample_memory()
+        return SystemSnapshot(
+            cpu_state=cpu_state,
+            cpu_percent=cpu_percent,
+            memory_used=memory_used,
+            memory_total=memory_total,
+            uptime_seconds=self._sample_uptime(),
+        )
+
+    @staticmethod
+    def system_drive_root():
+        root = os.environ.get("SystemDrive")
+        if not root:
+            root = os.path.splitdrive(os.environ.get("SystemRoot", ""))[0]
+        if os.name != "nt":
+            return os.path.abspath(os.sep)
+        root = (root or "C:").rstrip("\\/")
+        return os.path.abspath(root + os.sep)
+
+    def sample_disk(self):
+        root = self.system_drive_root()
+        try:
+            usage = shutil.disk_usage(root)
+            return DiskSnapshot(root, usage.used, usage.total, usage.free)
+        except Exception:
+            return DiskSnapshot(root)
+
+
 class DisplayManager:
     @staticmethod
     def _kelvin_to_rgb(temp_kelvin):
+        try:
+            temp_kelvin = max(1000.0, min(10000.0, float(temp_kelvin)))
+        except (TypeError, ValueError):
+            temp_kelvin = 6500.0
         t = temp_kelvin / 100
         if t <= 66:
             r = 255
@@ -128,16 +410,24 @@ class DisplayManager:
     @staticmethod
     def _build_ramp(r, g, b):
         ramp = (ctypes.c_ushort * 256 * 3)()
+        try:
+            channels = [max(0.0, min(1.0, float(channel)))
+                        for channel in (r, g, b)]
+        except (TypeError, ValueError):
+            channels = [1.0, 1.0, 1.0]
         for i in range(256):
             base = i * 256
-            ramp[0][i] = int(min(65535, r * base))
-            ramp[1][i] = int(min(65535, g * base))
-            ramp[2][i] = int(min(65535, b * base))
+            for channel_idx, channel in enumerate(channels):
+                ramp[channel_idx][i] = int(min(65535, channel * base))
         return ramp
 
     @classmethod
     def apply(cls, temp_kelvin, brightness):
         r, g, b = cls._kelvin_to_rgb(temp_kelvin)
+        try:
+            brightness = max(0.0, min(1.0, float(brightness)))
+        except (TypeError, ValueError):
+            brightness = 1.0
         r *= brightness; g *= brightness; b *= brightness
         ramp = cls._build_ramp(r, g, b)
         # 尝试多显示器
@@ -168,19 +458,26 @@ class DisplayManager:
             for hMon in monitors:
                 info = MONITORINFOEX()
                 info.cbSize = ctypes.sizeof(MONITORINFOEX)
-                ctypes.windll.user32.GetMonitorInfoW(hMon, ctypes.byref(info))
+                if not ctypes.windll.user32.GetMonitorInfoW(hMon, ctypes.byref(info)):
+                    continue
                 hdc = ctypes.windll.gdi32.CreateDCW(info.szDevice, None, None, None)
                 if hdc:
-                    ctypes.windll.gdi32.SetDeviceGammaRamp(hdc, ctypes.byref(ramp))
-                    ctypes.windll.gdi32.DeleteDC(hdc)
-                    applied = True
+                    try:
+                        ok = ctypes.windll.gdi32.SetDeviceGammaRamp(hdc, ctypes.byref(ramp))
+                    finally:
+                        ctypes.windll.gdi32.DeleteDC(hdc)
+                    applied = applied or bool(ok)
         except Exception:
             pass
         # 降级：主屏
         if not applied:
             try:
                 hdc = ctypes.windll.user32.GetDC(0)
-                ctypes.windll.gdi32.SetDeviceGammaRamp(hdc, ctypes.byref(ramp))
+                if hdc:
+                    try:
+                        ctypes.windll.gdi32.SetDeviceGammaRamp(hdc, ctypes.byref(ramp))
+                    finally:
+                        ctypes.windll.user32.ReleaseDC(0, hdc)
             except Exception:
                 pass
 
@@ -240,6 +537,7 @@ class SuperDimOverlay(QWidget):
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_NoSystemBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
         self._alpha = 80
         self.setGeometry(screen_geometry)
 
@@ -261,7 +559,7 @@ class DimManager:
 
     def show(self, alpha: int):
         self._active = True
-        self._alpha = alpha
+        self._alpha = max(0, min(200, int(alpha)))
         self._rebuild()
 
     def hide(self):
@@ -270,9 +568,9 @@ class DimManager:
             ov.hide()
 
     def set_alpha(self, alpha: int):
-        self._alpha = alpha
+        self._alpha = max(0, min(200, int(alpha)))
         for ov in self._overlays:
-            ov.set_alpha(alpha)
+            ov.set_alpha(self._alpha)
 
     def rebuild(self):
         """屏幕数量变化时重建（热插拔）。"""
@@ -297,12 +595,16 @@ class DimManager:
 #     #7: 关闭时停球定时器  #9: 前10秒锁定跳过
 # ─────────────────────────────────────────────
 class EyeExerciseOverlay(QWidget):
+    closed = pyqtSignal()
+
     def __init__(self, duration_secs=20, force_mode=False):
         super().__init__()
         self.total = duration_secs
         self.remaining = duration_secs
         self.force_mode = force_mode          # #9 强制模式
         self._lock_secs = 10 if force_mode else 0
+        self._can_close = False
+        self._closed_emitted = False
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.showFullScreen()
@@ -415,7 +717,31 @@ class EyeExerciseOverlay(QWidget):
         if self.remaining <= 0:
             self._close()
 
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Escape, Qt.Key_Q):
+            self._close()
+            return
+        super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        # 强制休息模式下，前 10 秒拦截 Alt+F4/窗口管理器关闭。
+        app = QApplication.instance()
+        shutting_down = bool(app and app.closingDown())
+        if (self.force_mode and self._lock_secs > 0 and self.remaining > 0
+                and not self._can_close and not shutting_down):
+            event.ignore()
+            return
+        self._cd.stop()
+        self._bt.stop()
+        event.accept()
+        if not self._closed_emitted:
+            self._closed_emitted = True
+            self.closed.emit()
+
     def _close(self):
+        if self.force_mode and self._lock_secs > 0 and self.remaining > 0:
+            return
+        self._can_close = True
         self._cd.stop()
         self._bt.stop()   # #7 确保球动画定时器停止
         self.close()
@@ -852,6 +1178,7 @@ class CareEyesApp(QWidget):
         self._warned_1min = False
         self._transition = SmoothTransition(self)
         self._dim_mgr = DimManager()     # #5 多屏超暗管理器
+        self._metrics = SystemMetricsCollector()
 
         self.hotkey_brightness.connect(self._hk_bright)
         self.hotkey_temperature.connect(self._hk_temp)
@@ -862,7 +1189,14 @@ class CareEyesApp(QWidget):
         self.init_tray()
         self.init_pet()
         self.init_timers()
+        self._refresh_today_summary()
+        self._refresh_countdown_label()
+        self._refresh_stats()
         self.init_hotkeys()
+        if self.super_dim and self.is_enabled:
+            self._dim_mgr.show(self.super_dim_alpha)
+        if self.auto_mode and self.is_enabled:
+            self._auto_mode_tick()
         self.apply_effect()
 
         # #2 权限检测：低权限时托盘提示
@@ -877,7 +1211,13 @@ class CareEyesApp(QWidget):
     def init_timers(self):
         self.rest_timer = QTimer(self)
         self.rest_timer.timeout.connect(self._on_rest_trigger)
-        self.rest_timer.start(self.rest_interval_min * 60 * 1000)
+        if self.is_enabled:
+            self.rest_timer.start(self.rest_interval_min * 60 * 1000)
+
+        # 全屏时只保留一个延迟重试，避免周期定时器和 singleShot 叠加。
+        self.rest_defer_timer = QTimer(self)
+        self.rest_defer_timer.setSingleShot(True)
+        self.rest_defer_timer.timeout.connect(self._on_rest_trigger)
 
         # #1 守护频率提升至 800ms
         self.guard_timer = QTimer(self)
@@ -896,6 +1236,12 @@ class CareEyesApp(QWidget):
         self.auto_timer = QTimer(self)
         self.auto_timer.timeout.connect(self._auto_mode_tick)
         self.auto_timer.start(60_000)
+
+        # 系统状态只用于展示，单独采样，避免影响护眼/休息定时器。
+        self.metrics_timer = QTimer(self)
+        self.metrics_timer.timeout.connect(self._refresh_system_metrics)
+        self.metrics_timer.start(2_000)
+        QTimer.singleShot(0, self._refresh_system_metrics)
 
         # #3 多显示器热插拔监听
         QApplication.instance().primaryScreenChanged.connect(self._on_screen_change)
@@ -1001,8 +1347,10 @@ class CareEyesApp(QWidget):
                 on_press=_on_press, on_release=_on_release, daemon=True
             )
             self._hk_listener.start()
-        except ImportError:
-            pass
+        except Exception:
+            # pynput 在无桌面会话/权限受限时可能抛 OSError 或 RuntimeError；
+            # 快捷键是可选能力，不应阻断主程序启动。
+            self._hk_listener = None
 
     def _hk_bright(self, d):
         self.bright_slider.setValue(max(30, min(100, int(self.bright*100)+d)))
@@ -1044,6 +1392,9 @@ class CareEyesApp(QWidget):
         QScrollBar:vertical {{ width:0; }}
         QSpinBox {{ background:#161b22; color:#c9d1d9; border:1px solid #30363d;
             border-radius:5px; padding:4px 8px; min-width:70px; }}
+        QProgressBar {{ background:#21262d; border:none; border-radius:3px;
+            min-height:6px; max-height:6px; text-align:center; }}
+        QProgressBar::chunk {{ background:{ac}; border-radius:3px; }}
         QCheckBox {{ spacing:8px; }}
         QCheckBox::indicator {{ width:15px; height:15px; border-radius:4px;
             border:1px solid #30363d; background:#161b22; }}
@@ -1190,6 +1541,7 @@ class CareEyesApp(QWidget):
         cl.addLayout(dim_row)
 
         lay.addWidget(card); lay.addStretch()
+        self._sync_mode_selection()
         return page
 
     def _mode_qss(self, active):
@@ -1200,6 +1552,15 @@ class CareEyesApp(QWidget):
         return ("QPushButton{background:#161b22;color:#8b949e;border-radius:8px;"
                 "border:1px solid #30363d;font-size:13px;}"
                 "QPushButton:hover{background:#1c2128;color:#e6edf3;}")
+
+    def _sync_mode_selection(self):
+        """让加载/重置后的滑条值与预设按钮状态保持一致。"""
+        if not hasattr(self, "mode_btns"):
+            return
+        for name, preset in MODES.items():
+            active = (self.temp == preset["temp"]
+                      and abs(self.bright - preset["bright"]) < 0.001)
+            self.mode_btns[name].setStyleSheet(self._mode_qss(active))
 
     # ══════════════════════════════════════════
     #  Page 1
@@ -1290,7 +1651,44 @@ class CareEyesApp(QWidget):
         cht.addWidget(self._caption("近7天用眼 (分钟)"))
         self.bar_chart = BarChart(); cht.addWidget(self.bar_chart)
         bot.addWidget(cc, 2)
-        lay.addLayout(bot); lay.addStretch()
+        lay.addLayout(bot)
+
+        # 轻量系统状态：帮助用户判断卡顿/高负载是否来自系统本身。
+        system_card = self._card()
+        system_grid = QGridLayout(system_card)
+        system_grid.setContentsMargins(14, 9, 14, 9)
+        system_grid.setHorizontalSpacing(16)
+        system_grid.setVerticalSpacing(2)
+        system_grid.addWidget(self._caption("系统状态"), 0, 0, 1, 4)
+        metrics = [
+            ("CPU", "system_cpu_value", "system_cpu_bar"),
+            ("内存", "system_memory_value", "system_memory_bar"),
+            ("磁盘", "system_disk_value", "system_disk_bar"),
+            ("运行时间", "system_uptime_value", None),
+        ]
+        for col, (label_text, value_attr, bar_attr) in enumerate(metrics):
+            label = QLabel(label_text)
+            label.setStyleSheet("color:#6e7681;font-size:11px;")
+            value = QLabel("—")
+            value.setMinimumWidth(78)
+            value.setStyleSheet("color:#e6edf3;font-size:13px;font-weight:600;")
+            setattr(self, value_attr, value)
+            system_grid.addWidget(label, 1, col)
+            system_grid.addWidget(value, 2, col)
+            if bar_attr:
+                bar = QProgressBar()
+                bar.setRange(0, 100)
+                bar.setValue(0)
+                bar.setTextVisible(False)
+                setattr(self, bar_attr, bar)
+                system_grid.addWidget(bar, 3, col)
+            else:
+                spacer = QFrame()
+                spacer.setFixedHeight(6)
+                system_grid.addWidget(spacer, 3, col)
+            system_grid.setColumnStretch(col, 1)
+        lay.addWidget(system_card)
+        lay.addStretch()
         return page
 
     # ══════════════════════════════════════════
@@ -1377,11 +1775,21 @@ class CareEyesApp(QWidget):
     def _quit_app(self):
         self._quitting = True
         self._save_settings()
+        for timer_name in ("rest_timer", "rest_defer_timer", "guard_timer",
+                           "stat_timer", "countdown_timer", "auto_timer",
+                           "metrics_timer"):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                timer.stop()
+        if self.overlay is not None:
+            self.overlay._can_close = True
+            self.overlay.close()
         self._dim_mgr.hide()
         if self.pet is not None:
             self.pet.close()
-        if hasattr(self, "_hk_listener"):
-            self._hk_listener.stop()
+        listener = getattr(self, "_hk_listener", None)
+        if listener is not None:
+            listener.stop()
         DisplayManager.reset()
         QApplication.quit()
 
@@ -1401,6 +1809,14 @@ class CareEyesApp(QWidget):
                 # #3 屏幕布局变化 → 重建超暗遮罩
                 QTimer.singleShot(400, self._on_screen_change)
             elif msg.message == WM_POWERBROADCAST and msg.wParam == PBT_APMRESUMESUSPEND:
+                metrics = getattr(self, "_metrics", None)
+                if metrics is not None:
+                    metrics.reset_cpu_baseline()
+                if self.is_enabled and self.overlay is None:
+                    self._next_rest_secs = self.rest_interval_min * 60
+                    self._warned_1min = False
+                    self._restart_rest_schedule()
+                    self._refresh_countdown_label()
                 QTimer.singleShot(2500, self.apply_effect)
         except Exception:
             pass
@@ -1420,33 +1836,51 @@ class CareEyesApp(QWidget):
         self.temp_val.setText(f"{self.temp} K")
         self.bright_val.setText(f"{int(self.bright*100)}%")
         self._transition.stop(); self.apply_effect()
+        self._sync_mode_selection()
         self._schedule_save()
 
     def apply_preset(self, name):
         p = MODES[name]
-        for n,btn in self.mode_btns.items(): btn.setStyleSheet(self._mode_qss(n==name))
-        self._transition.start(self.temp, self.bright, p['temp'], p['bright'], 1500)
+        if self.is_enabled:
+            self._transition.start(self.temp, self.bright, p['temp'], p['bright'], 1500)
+        else:
+            self._transition.stop()
         self.temp = p['temp']; self.bright = p['bright']
         for sl,val in [(self.temp_slider,self.temp),(self.bright_slider,int(self.bright*100))]:
             sl.blockSignals(True); sl.setValue(val); sl.blockSignals(False)
         self.temp_val.setText(f"{self.temp} K")
         self.bright_val.setText(f"{int(self.bright*100)}%")
+        self._sync_mode_selection()
         self._save_settings()
 
     def toggle_master(self):
         self.is_enabled = self.toggle.isChecked()
+        self.session_start = datetime.now()
         if self.is_enabled:
             self.toggle_label.setText("已开启")
             self.toggle_label.setStyleSheet(f"color:{self._accent};margin-right:8px;")
             self.apply_effect()
             if not self.guard_timer.isActive():   # #7 重新启动守护
                 self.guard_timer.start(800)
+            if self.super_dim:
+                self._dim_mgr.show(self.super_dim_alpha)
+            if self.auto_mode:
+                self._auto_mode_tick()
+            if self.overlay is None or not self.overlay.isVisible():
+                self._restart_rest_schedule()
         else:
             self.toggle_label.setText("已关闭")
             self.toggle_label.setStyleSheet("color:#484f58;margin-right:8px;")
             self._transition.stop()
             self.guard_timer.stop()               # #7 停止守护节省 CPU
+            self.rest_timer.stop()
+            self.rest_defer_timer.stop()
+            self._next_rest_secs = self.rest_interval_min * 60
+            self._warned_1min = False
+            self._dim_mgr.hide()
+            self.auto_status_lbl.setText("")
             DisplayManager.reset()
+        self._refresh_countdown_label()
         self._pet_state()
         self._save_settings()
 
@@ -1462,42 +1896,106 @@ class CareEyesApp(QWidget):
         self.rest_duration_sec = self.duration_spin.value()
         self._next_rest_secs = self.rest_interval_min * 60
         self._warned_1min = False
-        self.rest_timer.stop()
-        self.rest_timer.start(self.rest_interval_min * 60 * 1000)
+        self._restart_rest_schedule()
+        self._refresh_countdown_label()
         self._save_settings()
 
+    def _restart_rest_schedule(self):
+        """从当前时刻重新开始工作间隔，且不创建重复的延迟重试。"""
+        self.rest_timer.stop()
+        self.rest_defer_timer.stop()
+        if self.is_enabled:
+            self.rest_timer.start(self.rest_interval_min * 60 * 1000)
+
+    def _refresh_countdown_label(self):
+        if not self.is_enabled:
+            self.next_rest_label.setText("已暂停")
+            return
+        m = self._next_rest_secs // 60
+        s = self._next_rest_secs % 60
+        self.next_rest_label.setText(f"{m:02d}:{s:02d}")
+
+    def _refresh_today_summary(self):
+        self.today_stat.setText(f"今日 {self.today_minutes} 分钟")
+        self.today_stat.setStyleSheet("color:#6e7681;font-size:11px;")
+
     def _on_rest_trigger(self):
+        if not self.is_enabled or self._quitting:
+            return
+        if self.overlay is not None and self.overlay.isVisible():
+            self.rest_timer.stop()
+            return
         if self._is_fullscreen():
             self.fullscreen_warn.setText("⚠ 检测到全屏应用，休息提醒已推迟")
             self.tray.showMessage(APP_TITLE,"检测到全屏，休息已推迟5分钟",
                                   QSystemTrayIcon.Information,3000)
-            QTimer.singleShot(5*60*1000, self._on_rest_trigger); return
+            self.rest_timer.stop()
+            self._next_rest_secs = 5 * 60
+            self._warned_1min = False
+            self._refresh_countdown_label()
+            if self.pet is not None:
+                self.pet.set_countdown(self._next_rest_secs, 5 * 60)
+                self._pet_state()
+            if not self.rest_defer_timer.isActive():
+                self.rest_defer_timer.start(5 * 60 * 1000)
+            return
         self.fullscreen_warn.setText("")
         self.show_rest_overlay()
 
     def show_rest_overlay(self):
+        if self._quitting:
+            return
         if self.overlay is not None and self.overlay.isVisible():
             self.overlay.raise_()
             return
         self.overlay = EyeExerciseOverlay(self.rest_duration_sec,
                                           force_mode=self.force_rest)
-        self.overlay.destroyed.connect(lambda: setattr(self, "overlay", None))
+        self.overlay.closed.connect(self._on_overlay_closed)
         self.overlay.show()
+        if self.sound_enabled:
+            QApplication.beep()
+        # 休息期间暂停工作间隔，完整休息结束后再开始下一轮计时。
+        self.rest_timer.stop()
+        self.rest_defer_timer.stop()
         self._next_rest_secs = self.rest_interval_min * 60
         self._warned_1min = False; self.break_count += 1
         if self.pet is not None:
             self.pet.set_countdown(self._next_rest_secs, self.rest_interval_min * 60)
             self.pet.set_state("resting")
 
+    def _on_overlay_closed(self):
+        self.overlay = None
+        self.session_start = datetime.now()
+        self._next_rest_secs = self.rest_interval_min * 60
+        self._warned_1min = False
+        if self.pet is not None:
+            self.pet.set_countdown(self._next_rest_secs, self.rest_interval_min * 60)
+        self._pet_state()
+        if (self.is_enabled and not self._quitting
+                and not self.rest_timer.isActive()
+                and not self.rest_defer_timer.isActive()):
+            self._restart_rest_schedule()
+
     def _refresh_countdown(self):
+        if not self.is_enabled:
+            self._refresh_countdown_label()
+            return
+        if self.overlay is not None and self.overlay.isVisible():
+            self._refresh_countdown_label()
+            if self.pet is not None:
+                self.pet.set_countdown(self._next_rest_secs,
+                                       self.rest_interval_min * 60)
+                self._pet_state()
+            return
         self._next_rest_secs = max(0, self._next_rest_secs-1)
-        m = self._next_rest_secs//60; s = self._next_rest_secs%60
-        self.next_rest_label.setText(f"{m:02d}:{s:02d}")
+        self._refresh_countdown_label()
         if self.pet is not None:
             self.pet.set_countdown(self._next_rest_secs,
                                    self.rest_interval_min*60)
             self._pet_state()
-        if self._next_rest_secs == 60 and not self._warned_1min:
+        if (self._next_rest_secs == 60 and not self._warned_1min
+                and not self.rest_defer_timer.isActive()
+                and not (self.overlay and self.overlay.isVisible())):
             self._warned_1min = True
             self.tray.showMessage(APP_TITLE,"还有 1 分钟就该休息了 ☕",
                                   QSystemTrayIcon.Information,5000)
@@ -1506,17 +2004,20 @@ class CareEyesApp(QWidget):
 
     def _update_stat(self):
         today_str = date.today().isoformat()
-        if getattr(self, "_stat_date", today_str) != today_str:
-            self.today_minutes = 0
-            self.break_count = 0
-            self.session_start = datetime.now()
-            self._stat_date = today_str
-        if self.is_enabled: self.today_minutes += 1
+        self._rollover_stats_if_needed(today_str)
+        if self.is_enabled and not (self.overlay and self.overlay.isVisible()):
+            self.today_minutes += 1
         self.week_data[today_str] = self.today_minutes
-        self.today_stat.setText(f"今日 {self.today_minutes} 分钟")
-        self.today_stat.setStyleSheet("color:#6e7681;font-size:11px;")
+        self._refresh_today_summary()
+        # 统计数据不必每秒写盘，但不要等到退出才落盘。
+        self._stat_save_ticks = getattr(self, "_stat_save_ticks", 0) + 1
+        if self._stat_save_ticks >= 5:
+            self._stat_save_ticks = 0
+            self._schedule_save()
 
     def _refresh_stats(self):
+        if self._rollover_stats_if_needed():
+            self._schedule_save()
         sess = int((datetime.now()-self.session_start).total_seconds()/60)
         self.stat_today.setText(str(self.today_minutes))
         self.stat_session.setText(str(sess))
@@ -1528,6 +2029,43 @@ class CareEyesApp(QWidget):
             d = today - timedelta(days=i)
             days.append(d.strftime("%m/%d")); vals.append(self.week_data.get(d.isoformat(),0))
         self.bar_chart.set_data(vals,days)
+
+    def _refresh_system_metrics(self):
+        """刷新统计页的系统状态；任何单项失败都只影响该项。"""
+        try:
+            snapshot = self._metrics.sample_fast()
+        except Exception:
+            snapshot = SystemSnapshot()
+        try:
+            disk = self._metrics.sample_disk()
+        except Exception:
+            # 第三方驱动或受限环境不应影响主循环。
+            disk = DiskSnapshot(SystemMetricsCollector.system_drive_root())
+
+        cpu_pct = snapshot.cpu_percent if snapshot.cpu_state == "ready" else None
+        memory_pct = _percent(snapshot.memory_used, snapshot.memory_total)
+        disk_pct = _percent(disk.used, disk.total)
+
+        def set_metric(value_widget, bar_widget, pct, unavailable_text="不可用"):
+            if pct is None:
+                value_widget.setText(unavailable_text)
+                bar_widget.setValue(0)
+                return
+            value_widget.setText(f"{pct:.0f}%")
+            bar_widget.setValue(int(round(pct)))
+
+        cpu_state_text = "读取中" if snapshot.cpu_state == "warming" else "不可用"
+        set_metric(self.system_cpu_value, self.system_cpu_bar, cpu_pct, cpu_state_text)
+        set_metric(self.system_memory_value, self.system_memory_bar, memory_pct)
+        set_metric(self.system_disk_value, self.system_disk_bar, disk_pct)
+        self.system_uptime_value.setText(_format_uptime(snapshot.uptime_seconds))
+
+        self.system_memory_value.setToolTip(
+            f"已用 {_format_bytes(snapshot.memory_used)} / 总计 {_format_bytes(snapshot.memory_total)}"
+        )
+        self.system_disk_value.setToolTip(
+            f"已用 {_format_bytes(disk.used)} / 总计 {_format_bytes(disk.total)}\n{disk.root}"
+        )
 
     def _on_auto_toggle(self):
         self.auto_mode = self.auto_toggle.isChecked()
@@ -1550,7 +2088,7 @@ class CareEyesApp(QWidget):
     def _on_dim_toggle(self):
         self.super_dim = self.dim_toggle.isChecked()
         self.dim_slider.setEnabled(self.super_dim)
-        if self.super_dim:
+        if self.super_dim and self.is_enabled:
             self._dim_mgr.show(self.super_dim_alpha)
         else:
             self._dim_mgr.hide()
@@ -1558,7 +2096,7 @@ class CareEyesApp(QWidget):
 
     def _on_dim_alpha(self, val):
         self.super_dim_alpha = val
-        if self.super_dim:
+        if self.super_dim and self.is_enabled:
             self._dim_mgr.set_alpha(val)
         self._schedule_save()
 
@@ -1576,10 +2114,12 @@ class CareEyesApp(QWidget):
             hproc = ctypes.windll.kernel32.OpenProcess(0x0410, False, pid.value)
             proc_name = ""
             if hproc:
-                buf = ctypes.create_unicode_buffer(260)
-                ctypes.windll.psapi.GetModuleBaseNameW(hproc, None, buf, 260)
-                ctypes.windll.kernel32.CloseHandle(hproc)
-                proc_name = buf.value.lower()
+                try:
+                    buf = ctypes.create_unicode_buffer(260)
+                    ctypes.windll.psapi.GetModuleBaseNameW(hproc, None, buf, 260)
+                    proc_name = buf.value.lower()
+                finally:
+                    ctypes.windll.kernel32.CloseHandle(hproc)
 
             # 白名单：强制推迟
             if proc_name in FULLSCREEN_FORCE_DEFER:
@@ -1588,19 +2128,22 @@ class CareEyesApp(QWidget):
             if proc_name in FULLSCREEN_WHITELIST:
                 return False
 
-            # 尺寸判断
+            # 尺寸判断：对每个显示器分别判断，避免副屏使用主屏尺寸误判。
             rect = wt.RECT()
             ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            scr = QApplication.primaryScreen().geometry()
-            return (rect.right - rect.left >= scr.width() and
-                    rect.bottom - rect.top >= scr.height())
+            return any(
+                rect.left <= geo.left() and rect.top <= geo.top()
+                and rect.right >= geo.right() and rect.bottom >= geo.bottom()
+                for screen in QApplication.screens()
+                for geo in (screen.geometry(),)
+            )
         except Exception:
             return False
 
     def _on_screen_change(self, *args):
         """显示器热插拔：重应用 Gamma + 重建超暗遮罩。(#3)"""
         self.apply_effect()
-        if self.super_dim:
+        if self.super_dim and self.is_enabled:
             self._dim_mgr.rebuild()
         if self.pet is not None and self.pet.isVisible():
             self.pet.keep_on_screen()
@@ -1618,40 +2161,109 @@ class CareEyesApp(QWidget):
 
     def _set_autostart(self, enabled):
         path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        if winreg is None:
+            return
         try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,path,0,winreg.KEY_SET_VALUE)
-            if enabled:
-                app_path = os.path.realpath(sys.argv[0])
-                winreg.SetValueEx(key,APP_NAME,0,winreg.REG_SZ,f'"{app_path}"')
-            else:
-                try: winreg.DeleteValue(key,APP_NAME)
-                except FileNotFoundError: pass
-            winreg.CloseKey(key)
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0,
+                                winreg.KEY_SET_VALUE) as key:
+                if enabled:
+                    app_path = os.path.realpath(sys.argv[0])
+                    winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ,
+                                      f'"{app_path}"')
+                else:
+                    try:
+                        winreg.DeleteValue(key, APP_NAME)
+                    except FileNotFoundError:
+                        pass
         except Exception: pass
 
     def _read_autostart(self):
         path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        if winreg is None:
+            return False
         try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,path)
-            winreg.QueryValueEx(key,APP_NAME); winreg.CloseKey(key); return True
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as key:
+                winreg.QueryValueEx(key, APP_NAME)
+            return True
         except Exception: return False
 
     def _reset_settings(self):
-        self.temp=5000; self.bright=1.0
-        self.rest_interval_min=45; self.rest_duration_sec=20
-        self.auto_mode=False; self.super_dim=False; self.super_dim_alpha=80
-        self.force_rest=False; self.sound_enabled=True
-        self.temp_slider.setValue(5000); self.bright_slider.setValue(100)
-        self.interval_spin.setValue(45); self.duration_spin.setValue(20)
-        self.auto_toggle.setChecked(False)
-        self.dim_toggle.setChecked(False); self.dim_slider.setValue(80); self.dim_slider.setEnabled(False)
-        self.force_rest_cb.setChecked(False); self.sound_cb.setChecked(True)
+        # 复位控件时暂时屏蔽信号，避免连续触发多次 Gamma/注册表写入。
+        widgets = [self.temp_slider, self.bright_slider, self.interval_spin,
+                   self.duration_spin, self.auto_toggle, self.dim_toggle,
+                   self.dim_slider, self.force_rest_cb, self.sound_cb,
+                   self.pet_cb, self.autostart_cb]
+        for widget in widgets:
+            widget.blockSignals(True)
+        try:
+            self.temp = 5000
+            self.bright = 1.0
+            self.rest_interval_min = 45
+            self.rest_duration_sec = 20
+            self.auto_mode = False
+            self.super_dim = False
+            self.super_dim_alpha = 80
+            self.force_rest = False
+            self.sound_enabled = True
+            self.pet_enabled = True
+            self.autostart = False
+            self.temp_slider.setValue(5000)
+            self.bright_slider.setValue(100)
+            self.interval_spin.setValue(45)
+            self.duration_spin.setValue(20)
+            self.auto_toggle.setChecked(False)
+            self.dim_toggle.setChecked(False)
+            self.dim_slider.setValue(80)
+            self.dim_slider.setEnabled(False)
+            self.force_rest_cb.setChecked(False)
+            self.sound_cb.setChecked(True)
+            self.pet_cb.setChecked(True)
+            self.autostart_cb.setChecked(False)
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+
+        self._set_autostart(False)
+        if self.overlay is not None:
+            self.overlay._can_close = True
+            self.overlay.close()
         self._dim_mgr.hide()
         self._next_rest_secs = self.rest_interval_min * 60
         self._warned_1min = False
+        self._stat_date = date.today().isoformat()
+        self.today_minutes = 0
+        self.break_count = 0
+        self._stat_save_ticks = 0
+        self.week_data = {}
+        self.session_start = datetime.now()
         self.pet_pos = None                 # 桌宠回到右下角默认位置
-        self._hide_pet(); self._on_pet_toggle(True)
+        self._hide_pet()
+        self._show_pet()
+        if self.pet is not None:
+            self.pet.set_countdown(self._next_rest_secs, self.rest_interval_min * 60)
+        if hasattr(self, "pet_action"):
+            self.pet_action.blockSignals(True)
+            self.pet_action.setChecked(True)
+            self.pet_action.blockSignals(False)
+
+        self.is_enabled = True
+        self.toggle.blockSignals(True)
+        self.toggle.setChecked(True)
+        self.toggle.blockSignals(False)
+        self.toggle_label.setText("已开启")
+        self.toggle_label.setStyleSheet(f"color:{self._accent};margin-right:8px;")
+        self._transition.stop()
         self.apply_effect()
+        if not self.guard_timer.isActive():
+            self.guard_timer.start(800)
+        self._restart_rest_schedule()
+        self.auto_status_lbl.setText("")
+        self.fullscreen_warn.setText("")
+        self._sync_mode_selection()
+        self._refresh_today_summary()
+        self._refresh_countdown_label()
+        self._refresh_stats()
+        self._pet_state()
         self._save_settings()
 
     # ══════════════════════════════════════════
@@ -1661,7 +2273,8 @@ class CareEyesApp(QWidget):
         "temp":5000,"bright":1.0,"is_enabled":True,"rest_interval":45,"rest_duration":20,
         "force_rest":False,
         "auto_mode":False,"autostart":False,"super_dim":False,"super_dim_alpha":80,
-        "sound_enabled":True,"stat_date":"","today_minutes":0,"week_data":{},
+        "sound_enabled":True,"stat_date":"","today_minutes":0,"break_count":0,
+        "week_data":{},
         "pet_enabled":True,"pet_pos":[],
     }
 
@@ -1671,44 +2284,73 @@ class CareEyesApp(QWidget):
             try:
                 with open(CONFIG_FILE,"r",encoding="utf-8") as f:
                     raw = json.load(f)
+                if not isinstance(raw, dict):
+                    raise ValueError("configuration root must be an object")
                 for k,dv in self._DEFAULTS.items():
                     v = raw.get(k,dv)
                     if not isinstance(v,type(dv)): v=dv
                     cfg[k] = v
             except Exception:
                 pass  # 文件损坏 → 静默使用默认值
-        self.temp=max(2000, min(8000, int(cfg["temp"])))
-        self.bright=max(0.30, min(1.0, float(cfg["bright"])))
+        self.temp=_bounded_int(cfg["temp"], 5000, 2000, 8000)
+        self.bright=_bounded_float(cfg["bright"], 1.0, 0.30, 1.0)
         self.is_enabled=cfg["is_enabled"]
-        self.rest_interval_min=max(5, min(120, int(cfg["rest_interval"])))
-        self.rest_duration_sec=max(10, min(300, int(cfg["rest_duration"])))
+        self.rest_interval_min=_bounded_int(cfg["rest_interval"], 45, 5, 120)
+        self.rest_duration_sec=_bounded_int(cfg["rest_duration"], 20, 10, 300)
         self.force_rest=cfg["force_rest"]
         self.auto_mode=cfg["auto_mode"]; self.super_dim=cfg["super_dim"]
-        self.super_dim_alpha=max(20, min(200, int(cfg["super_dim_alpha"])))
+        self.super_dim_alpha=_bounded_int(cfg["super_dim_alpha"], 80, 20, 200)
         self.sound_enabled=cfg["sound_enabled"]
         self.pet_enabled=cfg["pet_enabled"]
-        pos=cfg["pet_pos"]
-        self.pet_pos=([int(pos[0]), int(pos[1])]
-                      if len(pos)==2 and all(isinstance(v,(int,float)) for v in pos)
-                      else None)
-        self.week_data={str(k): max(0, int(v)) for k,v in cfg["week_data"].items()
-                        if isinstance(k, str) and isinstance(v, (int, float))}
+        self.pet_pos=_parse_position(cfg["pet_pos"])
+        cutoff = date.today() - timedelta(days=31)
+        week_data = cfg["week_data"] if isinstance(cfg["week_data"], dict) else {}
+        self.week_data={str(k): _bounded_int(v, 0, 0, 24 * 60)
+                        for k,v in week_data.items()
+                        if isinstance(k, str) and isinstance(v, (int, float))
+                        and not isinstance(v, bool)
+                        and self._valid_stat_day(k, cutoff)}
         self._next_rest_secs=self.rest_interval_min*60
         today=date.today().isoformat()
+        stored_day = cfg["stat_date"] if isinstance(cfg["stat_date"], str) else ""
+        try:
+            stored_date = date.fromisoformat(stored_day)
+        except (TypeError, ValueError):
+            stored_date = None
+        stored_minutes = _bounded_int(cfg["today_minutes"], 0, 0, 24 * 60)
+        stored_breaks = _bounded_int(cfg["break_count"], 0, 0, 24 * 60)
+        # 如果程序在午夜前崩溃，旧配置里的当天数据仍应归档到旧日期。
+        if (stored_date is not None and stored_date.isoformat() != today
+                and self._valid_stat_day(stored_day, cutoff)):
+            self.week_data[stored_day] = stored_minutes
         self._stat_date=today
-        self.today_minutes=cfg["today_minutes"] if cfg["stat_date"]==today else 0
+        self.today_minutes=stored_minutes if stored_day == today else 0
+        self.break_count=stored_breaks if stored_day == today else 0
+        self._stat_save_ticks = 0
         self.autostart=self._read_autostart()
 
     def _save_settings(self):
         """原子写入：先写 .tmp 再 os.replace，防断电损坏。(#6)"""
-        today=date.today().isoformat(); self.week_data[today]=self.today_minutes
+        today=date.today().isoformat()
+        self._rollover_stats_if_needed(today)
+        self.week_data[today]=self.today_minutes
+        cutoff = date.today() - timedelta(days=31)
+        self.week_data = {
+            str(day): _bounded_int(minutes, 0, 0, 24 * 60)
+            for day, minutes in self.week_data.items()
+            if isinstance(day, str)
+            and isinstance(minutes, (int, float))
+            and not isinstance(minutes, bool)
+            and self._valid_stat_day(day, cutoff)
+        }
         data={
             "temp":self.temp,"bright":self.bright,"is_enabled":self.is_enabled,
             "rest_interval":self.rest_interval_min,"rest_duration":self.rest_duration_sec,
             "force_rest":self.force_rest,
             "auto_mode":self.auto_mode,"super_dim":self.super_dim,
             "super_dim_alpha":self.super_dim_alpha,"sound_enabled":self.sound_enabled,
-            "stat_date":today,"today_minutes":self.today_minutes,"week_data":self.week_data,
+            "stat_date":today,"today_minutes":self.today_minutes,
+            "break_count":self.break_count,"week_data":self.week_data,
             "pet_enabled":self.pet_enabled,"pet_pos":self.pet_pos or [],
         }
         tmp = CONFIG_FILE + ".tmp"
@@ -1719,6 +2361,39 @@ class CareEyesApp(QWidget):
         except Exception:
             try: os.remove(tmp)
             except Exception: pass
+
+    @staticmethod
+    def _valid_stat_day(value, cutoff):
+        try:
+            parsed = date.fromisoformat(value)
+            return cutoff <= parsed <= date.today()
+        except (TypeError, ValueError):
+            return False
+
+    def _rollover_stats_if_needed(self, today=None):
+        """在首次访问新的一天时归档旧数据，避免午夜附近丢失统计。"""
+        today = today or date.today().isoformat()
+        current = getattr(self, "_stat_date", today)
+        if current == today:
+            return False
+
+        try:
+            cutoff = date.fromisoformat(today) - timedelta(days=31)
+        except (TypeError, ValueError):
+            cutoff = date.today() - timedelta(days=31)
+        week_data = getattr(self, "week_data", {})
+        if (isinstance(week_data, dict) and isinstance(current, str)
+                and self._valid_stat_day(current, cutoff)):
+            week_data[current] = _bounded_int(
+                getattr(self, "today_minutes", 0), 0, 0, 24 * 60
+            )
+        self.week_data = week_data if isinstance(week_data, dict) else {}
+        self.today_minutes = 0
+        self.break_count = 0
+        self.session_start = datetime.now()
+        self._stat_date = today
+        self._stat_save_ticks = 0
+        return True
 
     def _schedule_save(self):
         if not hasattr(self, "_save_timer"):
@@ -1733,6 +2408,9 @@ class CareEyesApp(QWidget):
             self.hide()
             event.ignore()
             return
+        timer = getattr(self, "metrics_timer", None)
+        if timer is not None:
+            timer.stop()
         self._save_settings()
         self._dim_mgr.hide()
         if self.pet is not None:
