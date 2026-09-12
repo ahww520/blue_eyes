@@ -26,6 +26,7 @@ import math
 import json
 import os
 import shutil
+import time
 try:
     import winreg
 except ImportError:  # 允许在非 Windows 环境运行纯逻辑检查
@@ -36,13 +37,17 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QLabel,
     QSlider, QHBoxLayout, QFrame, QStackedWidget, QSpinBox,
     QSystemTrayIcon, QMenu, QAction, QCheckBox, QGraphicsDropShadowEffect,
-    QSizePolicy, QGridLayout, QProgressBar
+    QSizePolicy, QGridLayout, QProgressBar, QMessageBox
 )
 from PyQt5.QtCore import (
     Qt, QTimer, QRect, pyqtSignal, QObject
 )
 from PyQt5.QtGui import (
     QColor, QCursor, QFont, QFontMetrics, QIcon, QPainter, QPen, QPixmap
+)
+from careeyes_runtime import (
+    GammaController, SingleInstance, WindowsActivityMonitor,
+    WindowsGammaBackend, WorkClock,
 )
 
 # ─────────────────────────────────────────────
@@ -52,6 +57,7 @@ APP_NAME    = "CareEyesPro"
 APP_TITLE   = "CareEyes Pro"
 APP_VER     = "v5.2"
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".care_eyes_pro.json")
+IDLE_PAUSE_SECONDS = 300
 
 # 全屏检测：这些进程名即便占全屏也不触发推迟（黑名单=不推迟）
 FULLSCREEN_WHITELIST = {
@@ -389,6 +395,8 @@ class SystemMetricsCollector:
 
 
 class DisplayManager:
+    _controller = None
+
     @staticmethod
     def _kelvin_to_rgb(temp_kelvin):
         try:
@@ -430,60 +438,16 @@ class DisplayManager:
             brightness = 1.0
         r *= brightness; g *= brightness; b *= brightness
         ramp = cls._build_ramp(r, g, b)
-        # 尝试多显示器
-        applied = False
-        try:
-            monitors = []
-            MONITORENUMPROC = ctypes.WINFUNCTYPE(
-                ctypes.c_bool,
-                ctypes.wintypes.HMONITOR, ctypes.wintypes.HDC,
-                ctypes.POINTER(ctypes.wintypes.RECT), ctypes.wintypes.LPARAM
-            )
-            def _cb(hMon, hdcMon, lprcMon, dwData):
-                monitors.append(hMon)
-                return True
-            cb = MONITORENUMPROC(_cb)
-            ctypes.windll.user32.EnumDisplayMonitors(None, None, cb, 0)
-
-            # MONITORINFOEX: cbSize(4) + rcMonitor(16) + rcWork(16) + dwFlags(4) + szDevice(64)
-            class MONITORINFOEX(ctypes.Structure):
-                _fields_ = [
-                    ("cbSize", ctypes.wintypes.DWORD),
-                    ("rcMonitor", ctypes.wintypes.RECT),
-                    ("rcWork", ctypes.wintypes.RECT),
-                    ("dwFlags", ctypes.wintypes.DWORD),
-                    ("szDevice", ctypes.c_wchar * 32),
-                ]
-
-            for hMon in monitors:
-                info = MONITORINFOEX()
-                info.cbSize = ctypes.sizeof(MONITORINFOEX)
-                if not ctypes.windll.user32.GetMonitorInfoW(hMon, ctypes.byref(info)):
-                    continue
-                hdc = ctypes.windll.gdi32.CreateDCW(info.szDevice, None, None, None)
-                if hdc:
-                    try:
-                        ok = ctypes.windll.gdi32.SetDeviceGammaRamp(hdc, ctypes.byref(ramp))
-                    finally:
-                        ctypes.windll.gdi32.DeleteDC(hdc)
-                    applied = applied or bool(ok)
-        except Exception:
-            pass
-        # 降级：主屏
-        if not applied:
+        if cls._controller is None:
             try:
-                hdc = ctypes.windll.user32.GetDC(0)
-                if hdc:
-                    try:
-                        ctypes.windll.gdi32.SetDeviceGammaRamp(hdc, ctypes.byref(ramp))
-                    finally:
-                        ctypes.windll.user32.ReleaseDC(0, hdc)
-            except Exception:
-                pass
+                cls._controller = GammaController(WindowsGammaBackend())
+            except (AttributeError, OSError):
+                return False
+        return cls._controller.apply(ramp)
 
     @classmethod
     def reset(cls):
-        cls.apply(6500, 1.0)
+        return cls._controller.restore() if cls._controller is not None else True
 
 
 # ─────────────────────────────────────────────
@@ -603,6 +567,9 @@ class EyeExerciseOverlay(QWidget):
         self.remaining = duration_secs
         self.force_mode = force_mode          # #9 强制模式
         self._lock_secs = 10 if force_mode else 0
+        started = time.monotonic()
+        self._deadline = started + duration_secs
+        self._unlock_deadline = started + min(self._lock_secs, duration_secs)
         self._can_close = False
         self._closed_emitted = False
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
@@ -699,11 +666,15 @@ class EyeExerciseOverlay(QWidget):
         p.drawEllipse(self._cx - self._rx, self._cy - self._ry,
                       self._rx * 2, self._ry * 2)
 
+    def _sync_remaining(self):
+        now = time.monotonic()
+        self.remaining = max(0, math.ceil(self._deadline - now))
+        self._lock_secs = max(0, math.ceil(self._unlock_deadline - now))
+
     def _tick(self):
-        self.remaining -= 1
+        self._sync_remaining()
         # #9 解锁逻辑
-        if self.force_mode and self._lock_secs > 0:
-            self._lock_secs -= 1
+        if self.force_mode:
             if self._lock_secs <= 0:
                 self._skip.setEnabled(True)
                 if self._lock_lbl:
@@ -725,6 +696,7 @@ class EyeExerciseOverlay(QWidget):
 
     def closeEvent(self, event):
         # 强制休息模式下，前 10 秒拦截 Alt+F4/窗口管理器关闭。
+        self._sync_remaining()
         app = QApplication.instance()
         shutting_down = bool(app and app.closingDown())
         if (self.force_mode and self._lock_secs > 0 and self.remaining > 0
@@ -739,6 +711,7 @@ class EyeExerciseOverlay(QWidget):
             self.closed.emit()
 
     def _close(self):
+        self._sync_remaining()
         if self.force_mode and self._lock_secs > 0 and self.remaining > 0:
             return
         self._can_close = True
@@ -1154,9 +1127,14 @@ class CareEyesApp(QWidget):
     hotkey_temperature = pyqtSignal(int)
     hotkey_toggle = pyqtSignal()
 
-    def __init__(self):
+    def __init__(self, activation_message=0):
         super().__init__()
+        self._activation_message = activation_message
         self._quitting = False
+        self._session_locked = False
+        self._suspended = False
+        self._rest_deferred = False
+        self._pause_reason = ""
         self.overlay = None
         self.pet = None
         # ── 读取系统主题色 (#10) ──
@@ -1171,7 +1149,6 @@ class CareEyesApp(QWidget):
         self.autostart = False; self.sound_enabled = True
         self.pet_enabled = True
         self.pet_pos = None
-        self.session_start = datetime.now()
         self.today_minutes = 0; self.break_count = 0
         self.week_data = {}
         self._next_rest_secs = self.rest_interval_min * 60
@@ -1185,10 +1162,14 @@ class CareEyesApp(QWidget):
         self.hotkey_toggle.connect(self._hk_toggle)
 
         self.load_settings()
+        self._work_clock = WorkClock(self.rest_interval_min * 60)
+        self._activity = WindowsActivityMonitor()
         self.init_ui()
+        self._activity.register(int(self.winId()))
         self.init_tray()
         self.init_pet()
         self.init_timers()
+        self._sync_work_clock()
         self._refresh_today_summary()
         self._refresh_countdown_label()
         self._refresh_stats()
@@ -1209,16 +1190,6 @@ class CareEyesApp(QWidget):
 
     # ══════════════════════════════════════════
     def init_timers(self):
-        self.rest_timer = QTimer(self)
-        self.rest_timer.timeout.connect(self._on_rest_trigger)
-        if self.is_enabled:
-            self.rest_timer.start(self.rest_interval_min * 60 * 1000)
-
-        # 全屏时只保留一个延迟重试，避免周期定时器和 singleShot 叠加。
-        self.rest_defer_timer = QTimer(self)
-        self.rest_defer_timer.setSingleShot(True)
-        self.rest_defer_timer.timeout.connect(self._on_rest_trigger)
-
         # #1 守护频率提升至 800ms
         self.guard_timer = QTimer(self)
         self.guard_timer.timeout.connect(self._guard_apply)
@@ -1773,11 +1744,18 @@ class CareEyesApp(QWidget):
         self.tray.show()
 
     def _quit_app(self):
+        self._cleanup()
+        QApplication.quit()
+
+    def _cleanup(self):
+        if self._quitting:
+            return
+        self._sync_work_clock()
         self._quitting = True
+        self._transition.stop()
         self._save_settings()
-        for timer_name in ("rest_timer", "rest_defer_timer", "guard_timer",
-                           "stat_timer", "countdown_timer", "auto_timer",
-                           "metrics_timer"):
+        for timer_name in ("guard_timer", "stat_timer", "countdown_timer",
+                           "auto_timer", "metrics_timer", "_save_timer"):
             timer = getattr(self, timer_name, None)
             if timer is not None:
                 timer.stop()
@@ -1790,8 +1768,9 @@ class CareEyesApp(QWidget):
         listener = getattr(self, "_hk_listener", None)
         if listener is not None:
             listener.stop()
+        self._activity.close()
+        self.tray.hide()
         DisplayManager.reset()
-        QApplication.quit()
 
     # ══════════════════════════════════════════
     #  电源事件（休眠唤醒）
@@ -1800,27 +1779,42 @@ class CareEyesApp(QWidget):
         WM_SETTINGCHANGE      = 0x001A
         WM_DISPLAYCHANGE      = 0x007E
         WM_POWERBROADCAST     = 0x0218
-        PBT_APMRESUMESUSPEND  = 0x0007
+        WM_WTSSESSION_CHANGE  = 0x02B1
         try:
             msg = ctypes.cast(int(message), ctypes.POINTER(ctypes.wintypes.MSG)).contents
+            activation_message = getattr(self, "_activation_message", 0)
+            if activation_message and msg.message == activation_message:
+                self._open_main()
+                return True, 0
             if msg.message in (WM_SETTINGCHANGE, WM_DISPLAYCHANGE):
                 # #1 系统设置/分辨率变化 → 立即重应用
                 QTimer.singleShot(300, self.apply_effect)
                 # #3 屏幕布局变化 → 重建超暗遮罩
                 QTimer.singleShot(400, self._on_screen_change)
-            elif msg.message == WM_POWERBROADCAST and msg.wParam == PBT_APMRESUMESUSPEND:
-                metrics = getattr(self, "_metrics", None)
-                if metrics is not None:
-                    metrics.reset_cpu_baseline()
-                if self.is_enabled and self.overlay is None:
-                    self._next_rest_secs = self.rest_interval_min * 60
-                    self._warned_1min = False
-                    self._restart_rest_schedule()
-                    self._refresh_countdown_label()
-                QTimer.singleShot(2500, self.apply_effect)
+            elif msg.message == WM_WTSSESSION_CHANGE and msg.wParam in (7, 8):
+                self._set_session_pause(locked=msg.wParam == 7)
+            elif msg.message == WM_POWERBROADCAST:
+                if msg.wParam == 0x0004:
+                    self._set_session_pause(suspended=True)
+                elif msg.wParam in (0x0006, 0x0007, 0x0012):
+                    self._set_session_pause(suspended=False)
+                    self._metrics.reset_cpu_baseline()
+                    QTimer.singleShot(2500, self.apply_effect)
         except Exception:
             pass
         return False, 0
+
+    def _set_session_pause(self, locked=None, suspended=None):
+        if locked is False or suspended is False:
+            self._work_clock.sample(False, float("inf"))
+        else:
+            self._sync_work_clock()
+        if locked is not None:
+            self._session_locked = locked
+        if suspended is not None:
+            self._suspended = suspended
+        self._sync_work_clock()
+        self._refresh_countdown_label()
 
     # ══════════════════════════════════════════
     #  逻辑
@@ -1854,8 +1848,8 @@ class CareEyesApp(QWidget):
         self._save_settings()
 
     def toggle_master(self):
+        self._sync_work_clock()
         self.is_enabled = self.toggle.isChecked()
-        self.session_start = datetime.now()
         if self.is_enabled:
             self.toggle_label.setText("已开启")
             self.toggle_label.setStyleSheet(f"color:{self._accent};margin-right:8px;")
@@ -1867,16 +1861,13 @@ class CareEyesApp(QWidget):
             if self.auto_mode:
                 self._auto_mode_tick()
             if self.overlay is None or not self.overlay.isVisible():
-                self._restart_rest_schedule()
+                self._restart_rest_schedule(reset_session=True)
         else:
             self.toggle_label.setText("已关闭")
             self.toggle_label.setStyleSheet("color:#484f58;margin-right:8px;")
             self._transition.stop()
             self.guard_timer.stop()               # #7 停止守护节省 CPU
-            self.rest_timer.stop()
-            self.rest_defer_timer.stop()
-            self._next_rest_secs = self.rest_interval_min * 60
-            self._warned_1min = False
+            self._restart_rest_schedule(reset_session=True)
             self._dim_mgr.hide()
             self.auto_status_lbl.setText("")
             DisplayManager.reset()
@@ -1885,10 +1876,11 @@ class CareEyesApp(QWidget):
         self._save_settings()
 
     def apply_effect(self):
-        if self.is_enabled: DisplayManager.apply(self.temp, self.bright)
+        if self.is_enabled and not self._quitting:
+            DisplayManager.apply(self.temp, self.bright)
 
     def _guard_apply(self):
-        if self.is_enabled and not self._transition._timer.isActive():
+        if self.is_enabled and not self._quitting and not self._transition._timer.isActive():
             DisplayManager.apply(self.temp, self.bright)
 
     def apply_timer_settings(self):
@@ -1900,20 +1892,60 @@ class CareEyesApp(QWidget):
         self._refresh_countdown_label()
         self._save_settings()
 
-    def _restart_rest_schedule(self):
-        """从当前时刻重新开始工作间隔，且不创建重复的延迟重试。"""
-        self.rest_timer.stop()
-        self.rest_defer_timer.stop()
-        if self.is_enabled:
-            self.rest_timer.start(self.rest_interval_min * 60 * 1000)
+    def _restart_rest_schedule(self, reset_session=False):
+        self._sync_work_clock()
+        self._rest_deferred = False
+        self._warned_1min = False
+        self._work_clock.restart(self.rest_interval_min * 60, reset_session)
+        self._next_rest_secs = self._work_clock.remaining_seconds
+
+    def _sync_work_clock(self):
+        clock = getattr(self, "_work_clock", None)
+        if clock is None:
+            return
+        blocked = self._quitting or not self.is_enabled or self.overlay is not None
+        self._pause_reason = ""
+        if self._session_locked:
+            blocked = True
+            self._pause_reason = "锁屏"
+        elif self._suspended:
+            blocked = True
+            self._pause_reason = "休眠"
+        inactive_seconds = float("inf") if blocked else 0.0
+        idle_seconds = None if blocked else self._activity.idle_seconds()
+        if idle_seconds is not None and idle_seconds >= IDLE_PAUSE_SECONDS:
+            inactive_seconds = idle_seconds - IDLE_PAUSE_SECONDS
+            blocked = True
+            self._pause_reason = "空闲"
+        elapsed = clock.sample(not blocked, inactive_seconds)
+        now = datetime.now()
+        today = now.date().isoformat()
+        if self._stat_date != today:
+            midnight = datetime.combine(now.date(), datetime.min.time())
+            end_offset = inactive_seconds if math.isfinite(inactive_seconds) else 0.0
+            today_elapsed = max(0.0, (now - midnight).total_seconds() - end_offset)
+            previous_elapsed = max(0.0, elapsed - today_elapsed)
+            self._today_seconds += previous_elapsed
+            self.today_minutes = min(1440, int(self._today_seconds / 60))
+            self._rollover_stats_if_needed(today)
+            elapsed -= previous_elapsed
+        self._today_seconds = min(86400.0, self._today_seconds + elapsed)
+        self.today_minutes = int(self._today_seconds / 60)
+        self.week_data[today] = self.today_minutes
+        self._next_rest_secs = clock.remaining_seconds
 
     def _refresh_countdown_label(self):
         if not self.is_enabled:
             self.next_rest_label.setText("已暂停")
             return
-        m = self._next_rest_secs // 60
-        s = self._next_rest_secs % 60
-        self.next_rest_label.setText(f"{m:02d}:{s:02d}")
+        if self.overlay is not None:
+            self.next_rest_label.setText("休息中")
+            return
+        minutes, seconds = divmod(self._next_rest_secs, 60)
+        label = f"{minutes:02d}:{seconds:02d}"
+        if self._pause_reason:
+            label += f" · {self._pause_reason}暂停"
+        self.next_rest_label.setText(label)
 
     def _refresh_today_summary(self):
         self.today_stat.setText(f"今日 {self.today_minutes} 分钟")
@@ -1922,22 +1954,23 @@ class CareEyesApp(QWidget):
     def _on_rest_trigger(self):
         if not self.is_enabled or self._quitting:
             return
-        if self.overlay is not None and self.overlay.isVisible():
-            self.rest_timer.stop()
+        self._sync_work_clock()
+        if self.overlay is not None or not self._work_clock.active:
+            return
+        if self._work_clock.remaining_seconds > 0:
             return
         if self._is_fullscreen():
             self.fullscreen_warn.setText("⚠ 检测到全屏应用，休息提醒已推迟")
             self.tray.showMessage(APP_TITLE,"检测到全屏，休息已推迟5分钟",
                                   QSystemTrayIcon.Information,3000)
-            self.rest_timer.stop()
-            self._next_rest_secs = 5 * 60
+            self._rest_deferred = True
+            self._work_clock.restart(5 * 60)
+            self._next_rest_secs = self._work_clock.remaining_seconds
             self._warned_1min = False
             self._refresh_countdown_label()
             if self.pet is not None:
                 self.pet.set_countdown(self._next_rest_secs, 5 * 60)
                 self._pet_state()
-            if not self.rest_defer_timer.isActive():
-                self.rest_defer_timer.start(5 * 60 * 1000)
             return
         self.fullscreen_warn.setText("")
         self.show_rest_overlay()
@@ -1948,54 +1981,43 @@ class CareEyesApp(QWidget):
         if self.overlay is not None and self.overlay.isVisible():
             self.overlay.raise_()
             return
+        self._sync_work_clock()
         self.overlay = EyeExerciseOverlay(self.rest_duration_sec,
                                           force_mode=self.force_rest)
+        self._restart_rest_schedule()
         self.overlay.closed.connect(self._on_overlay_closed)
         self.overlay.show()
         if self.sound_enabled:
             QApplication.beep()
-        # 休息期间暂停工作间隔，完整休息结束后再开始下一轮计时。
-        self.rest_timer.stop()
-        self.rest_defer_timer.stop()
-        self._next_rest_secs = self.rest_interval_min * 60
-        self._warned_1min = False; self.break_count += 1
+        self.break_count += 1
+        self._refresh_countdown_label()
         if self.pet is not None:
             self.pet.set_countdown(self._next_rest_secs, self.rest_interval_min * 60)
             self.pet.set_state("resting")
 
     def _on_overlay_closed(self):
+        self._sync_work_clock()
         self.overlay = None
-        self.session_start = datetime.now()
-        self._next_rest_secs = self.rest_interval_min * 60
-        self._warned_1min = False
+        self._restart_rest_schedule(reset_session=True)
         if self.pet is not None:
             self.pet.set_countdown(self._next_rest_secs, self.rest_interval_min * 60)
         self._pet_state()
-        if (self.is_enabled and not self._quitting
-                and not self.rest_timer.isActive()
-                and not self.rest_defer_timer.isActive()):
-            self._restart_rest_schedule()
+        self._refresh_countdown_label()
 
     def _refresh_countdown(self):
-        if not self.is_enabled:
-            self._refresh_countdown_label()
-            return
-        if self.overlay is not None and self.overlay.isVisible():
-            self._refresh_countdown_label()
-            if self.pet is not None:
-                self.pet.set_countdown(self._next_rest_secs,
-                                       self.rest_interval_min * 60)
-                self._pet_state()
-            return
-        self._next_rest_secs = max(0, self._next_rest_secs-1)
+        previous_minutes = self.today_minutes
+        self._sync_work_clock()
+        if self._work_clock.active and self._next_rest_secs == 0:
+            self._on_rest_trigger()
         self._refresh_countdown_label()
+        if self.today_minutes != previous_minutes:
+            self._refresh_today_summary()
         if self.pet is not None:
-            self.pet.set_countdown(self._next_rest_secs,
-                                   self.rest_interval_min*60)
+            total = 5 * 60 if self._rest_deferred else self.rest_interval_min * 60
+            self.pet.set_countdown(self._next_rest_secs, total)
             self._pet_state()
-        if (self._next_rest_secs == 60 and not self._warned_1min
-                and not self.rest_defer_timer.isActive()
-                and not (self.overlay and self.overlay.isVisible())):
+        if (self._work_clock.active and 0 < self._next_rest_secs <= 60
+                and not self._warned_1min and not self._rest_deferred):
             self._warned_1min = True
             self.tray.showMessage(APP_TITLE,"还有 1 分钟就该休息了 ☕",
                                   QSystemTrayIcon.Information,5000)
@@ -2003,12 +2025,9 @@ class CareEyesApp(QWidget):
                 self.pet.say("还有 1 分钟就休息啦", 6000)
 
     def _update_stat(self):
-        today_str = date.today().isoformat()
-        self._rollover_stats_if_needed(today_str)
-        if self.is_enabled and not (self.overlay and self.overlay.isVisible()):
-            self.today_minutes += 1
-        self.week_data[today_str] = self.today_minutes
+        self._sync_work_clock()
         self._refresh_today_summary()
+        self._refresh_stats()
         # 统计数据不必每秒写盘，但不要等到退出才落盘。
         self._stat_save_ticks = getattr(self, "_stat_save_ticks", 0) + 1
         if self._stat_save_ticks >= 5:
@@ -2016,9 +2035,8 @@ class CareEyesApp(QWidget):
             self._schedule_save()
 
     def _refresh_stats(self):
-        if self._rollover_stats_if_needed():
-            self._schedule_save()
-        sess = int((datetime.now()-self.session_start).total_seconds()/60)
+        self._sync_work_clock()
+        sess = int(self._work_clock.session_seconds / 60)
         self.stat_today.setText(str(self.today_minutes))
         self.stat_session.setText(str(sess))
         self.stat_breaks.setText(str(self.break_count))
@@ -2074,7 +2092,7 @@ class CareEyesApp(QWidget):
         self._schedule_save()
 
     def _auto_mode_tick(self):
-        if not self.auto_mode or not self.is_enabled: return
+        if not self.auto_mode or not self.is_enabled or self._quitting: return
         h = datetime.now().hour; m = datetime.now().minute
         t0 = AUTO_CURVE[h]; t1 = AUTO_CURVE[(h+1)%24]
         target = int(t0 + (t1-t0)*m/60)
@@ -2142,7 +2160,12 @@ class CareEyesApp(QWidget):
 
     def _on_screen_change(self, *args):
         """显示器热插拔：重应用 Gamma + 重建超暗遮罩。(#3)"""
-        self.apply_effect()
+        if self._quitting:
+            return
+        if self.is_enabled:
+            self.apply_effect()
+        else:
+            DisplayManager.reset()
         if self.super_dim and self.is_enabled:
             self._dim_mgr.rebuild()
         if self.pet is not None and self.pet.isVisible():
@@ -2188,6 +2211,7 @@ class CareEyesApp(QWidget):
         except Exception: return False
 
     def _reset_settings(self):
+        self._sync_work_clock()
         # 复位控件时暂时屏蔽信号，避免连续触发多次 Gamma/注册表写入。
         widgets = [self.temp_slider, self.bright_slider, self.interval_spin,
                    self.duration_spin, self.auto_toggle, self.dim_toggle,
@@ -2232,10 +2256,11 @@ class CareEyesApp(QWidget):
         self._warned_1min = False
         self._stat_date = date.today().isoformat()
         self.today_minutes = 0
+        self._today_seconds = 0.0
         self.break_count = 0
         self._stat_save_ticks = 0
         self.week_data = {}
-        self.session_start = datetime.now()
+        self._work_clock.restart(self.rest_interval_min * 60, reset_session=True)
         self.pet_pos = None                 # 桌宠回到右下角默认位置
         self._hide_pet()
         self._show_pet()
@@ -2274,6 +2299,7 @@ class CareEyesApp(QWidget):
         "force_rest":False,
         "auto_mode":False,"autostart":False,"super_dim":False,"super_dim_alpha":80,
         "sound_enabled":True,"stat_date":"","today_minutes":0,"break_count":0,
+        "today_seconds":-1.0,
         "week_data":{},
         "pet_enabled":True,"pet_pos":[],
     }
@@ -2318,6 +2344,11 @@ class CareEyesApp(QWidget):
         except (TypeError, ValueError):
             stored_date = None
         stored_minutes = _bounded_int(cfg["today_minutes"], 0, 0, 24 * 60)
+        stored_seconds = _bounded_float(cfg["today_seconds"], -1.0, -1.0, 86400.0)
+        if stored_seconds < 0:
+            stored_seconds = float(stored_minutes * 60)
+        else:
+            stored_minutes = int(stored_seconds / 60)
         stored_breaks = _bounded_int(cfg["break_count"], 0, 0, 24 * 60)
         # 如果程序在午夜前崩溃，旧配置里的当天数据仍应归档到旧日期。
         if (stored_date is not None and stored_date.isoformat() != today
@@ -2325,12 +2356,14 @@ class CareEyesApp(QWidget):
             self.week_data[stored_day] = stored_minutes
         self._stat_date=today
         self.today_minutes=stored_minutes if stored_day == today else 0
+        self._today_seconds=stored_seconds if stored_day == today else 0.0
         self.break_count=stored_breaks if stored_day == today else 0
         self._stat_save_ticks = 0
         self.autostart=self._read_autostart()
 
     def _save_settings(self):
         """原子写入：先写 .tmp 再 os.replace，防断电损坏。(#6)"""
+        self._sync_work_clock()
         today=date.today().isoformat()
         self._rollover_stats_if_needed(today)
         self.week_data[today]=self.today_minutes
@@ -2350,6 +2383,7 @@ class CareEyesApp(QWidget):
             "auto_mode":self.auto_mode,"super_dim":self.super_dim,
             "super_dim_alpha":self.super_dim_alpha,"sound_enabled":self.sound_enabled,
             "stat_date":today,"today_minutes":self.today_minutes,
+            "today_seconds":self._today_seconds,
             "break_count":self.break_count,"week_data":self.week_data,
             "pet_enabled":self.pet_enabled,"pet_pos":self.pet_pos or [],
         }
@@ -2389,8 +2423,8 @@ class CareEyesApp(QWidget):
             )
         self.week_data = week_data if isinstance(week_data, dict) else {}
         self.today_minutes = 0
+        self._today_seconds = 0.0
         self.break_count = 0
-        self.session_start = datetime.now()
         self._stat_date = today
         self._stat_save_ticks = 0
         return True
@@ -2422,12 +2456,43 @@ class CareEyesApp(QWidget):
 # ─────────────────────────────────────────────
 # 🚀  入口
 # ─────────────────────────────────────────────
-if __name__ == "__main__":
+def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps,    True)
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setQuitOnLastWindowClosed(False)
-    window = CareEyesApp()
-    window.show()
-    sys.exit(app.exec_())
+    instance = None
+    window = None
+    primary = False
+    try:
+        try:
+            instance = SingleInstance(APP_NAME, CONFIG_FILE)
+            primary = instance.acquire()
+        except OSError as error:
+            QMessageBox.critical(None, APP_TITLE, f"无法建立单实例保护，程序未启动。\n{error}")
+            return 1
+        if not primary:
+            if not instance.activate_existing():
+                QMessageBox.information(None, APP_TITLE, "程序已在运行，请从系统托盘打开。")
+            return 0
+        window = CareEyesApp(instance.activation_message)
+        instance.allow_activation(int(window.winId()))
+        app.aboutToQuit.connect(window._cleanup)
+        window.show()
+        return app.exec_()
+    finally:
+        try:
+            if window is not None:
+                window._cleanup()
+        finally:
+            try:
+                if primary:
+                    DisplayManager.reset()
+            finally:
+                if instance is not None:
+                    instance.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

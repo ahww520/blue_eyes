@@ -41,6 +41,9 @@
 | **强制休息模式** | 前 10 秒锁定"跳过"按钮，确保眼睛真正离开屏幕 |
 | **托盘气泡预警** | 休息前 1 分钟弹出气泡提醒，不突然全屏打断 |
 | **全屏自动推迟** | 检测到游戏/视频全屏时，自动推迟 5 分钟，附进程白名单过滤 |
+| **空闲自动暂停** | 锁屏、休眠或连续 5 分钟没有键鼠输入时暂停工作倒计时和用眼统计，恢复操作后继续剩余时间 |
+
+倒计时和连续用眼时长使用单调时钟，不依赖回调次数或系统时间调整。全屏推迟也使用同一计时状态，避免重复提醒。观看视频、阅读时如果连续 5 分钟无输入，同样会按空闲处理。
 
 ### 📊 用眼统计
 - 今日用眼总分钟数
@@ -67,9 +70,13 @@
 - **开机自启动** — 真实写入注册表 `HKCU\...\Run`，UI 开关联动
 - **全局快捷键** — 无需打开界面即可调节（见下表）
 - **多显示器支持** — 所有屏幕同步应用 Gamma，热插拔自动补全
+- **原始色彩恢复** — 首次改色前保存每块屏幕的原始 Gamma；关闭护眼或正常退出时还原，不再用近似 6500K 代替原始曲线。无法读取原始曲线的屏幕不会被修改
+- **单实例保护** — 同一用户、同一 Windows 会话重复启动时只唤醒已有窗口，避免多进程争抢 Gamma、快捷键和配置文件
 - **系统主题色跟随** — 读取 Windows 强调色，UI 配色自动适配
 - **HiDPI 自适应** — 4K 屏下界面不模糊
 - **配置容错** — 断电损坏自动恢复默认，原子写入防数据丢失
+
+> Gamma 快照保存在进程内存中。正常退出、关闭护眼及可正常展开退出清理的启动异常会尝试恢复；强制结束进程、驱动异常或断电无法保证执行恢复。重插显示器后会重试尚未完成的恢复。
 
 ---
 
@@ -203,6 +210,7 @@ C:\Users\<你的用户名>\.care_eyes_pro.json
   "sound_enabled": true,
   "stat_date": "2025-08-01",
   "today_minutes": 132,
+  "today_seconds": 7920.0,
   "break_count": 3,
   "week_data": {
     "2025-07-26": 310,
@@ -212,6 +220,8 @@ C:\Users\<你的用户名>\.care_eyes_pro.json
 ```
 
 > 手动编辑后重启程序生效。若文件格式错误，程序启动时自动恢复默认值。
+
+`today_seconds` 保存不足一分钟的累计时长；存在有效值时，`today_minutes` 由其计算。旧配置没有此字段时自动从原有分钟数迁移。空闲阈值当前为 `mainpro.py` 中的 `IDLE_PAUSE_SECONDS = 300`。
 
 ---
 
@@ -227,7 +237,7 @@ mainpro.py
 ├── DisplayManager            多显示器 Gamma 控制
 │   ├── _kelvin_to_rgb()      色温 → RGB 比例（Tanner Helland 算法）
 │   ├── _build_ramp()         构建 256 级 Gamma 查找表
-│   └── apply() / reset()     EnumDisplayMonitors 遍历所有屏幕
+│   └── apply() / reset()     委托运行时模块保存、应用及恢复各屏 Gamma
 │
 ├── SmoothTransition          平滑色温渐变（ease-out cubic，50ms 步进）
 │
@@ -243,21 +253,22 @@ mainpro.py
 ├── BarChart                  自绘7天柱状图
 │
 └── CareEyesApp               主窗口
-    ├── init_timers()         守护(800ms) / 统计(1min) / 倒计时(1s) / 自动模式(1min) / 系统状态(2s)
+    ├── init_timers()         守护(800ms) / 统计刷新(1min) / 工作时钟采样(1s) / 自动模式(1min) / 系统状态(2s)
     ├── init_hotkeys()        pynput 全局键盘监听（后台线程）
-    ├── nativeEvent()         WM_SETTINGCHANGE / WM_DISPLAYCHANGE / WM_POWERBROADCAST
+    ├── nativeEvent()         显示器、电源、会话锁屏事件及单实例唤醒消息
     ├── _is_fullscreen()      进程名黑白名单 + 窗口尺寸双重判断
     └── _save_settings()      原子写入 JSON
 ```
+
+`careeyes_runtime.py` 封装 Win32 Gamma、单实例 Mutex、空闲/会话通知以及可注入时钟的 `WorkClock`。原生 API 声明完整句柄类型；回归测试通过替身后端验证恢复流程，不写入真实屏幕 Gamma。
 
 ### 核心定时器说明
 
 | 定时器 | 频率 | 用途 |
 |--------|------|------|
 | `guard_timer` | 800ms | 强制重应用 Gamma，抵抗 UAC/驱动重置 |
-| `rest_timer` | 用户设定 | 触发休息提醒 |
-| `countdown_timer` | 1s | 刷新"距下次休息"倒计时 |
-| `stat_timer` | 1min | 累加今日用眼分钟数 |
+| `countdown_timer` | 1s | 采样单调工作时钟，累计实际活动秒数，并统一触发休息或全屏推迟 |
+| `stat_timer` | 1min | 刷新统计展示，每 5 次刷新安排持久化，不按回调次数累加分钟 |
 | `auto_timer` | 1min | 计算并应用昼夜色温曲线 |
 
 ---
