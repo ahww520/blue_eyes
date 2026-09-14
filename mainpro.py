@@ -37,13 +37,14 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QLabel,
     QSlider, QHBoxLayout, QFrame, QStackedWidget, QSpinBox,
     QSystemTrayIcon, QMenu, QAction, QCheckBox, QGraphicsDropShadowEffect,
-    QSizePolicy, QGridLayout, QProgressBar, QMessageBox, QComboBox
+    QSizePolicy, QGridLayout, QProgressBar, QMessageBox
 )
 from PyQt5.QtCore import (
     Qt, QTimer, QRect, pyqtSignal, QObject
 )
 from PyQt5.QtGui import (
-    QColor, QCursor, QFont, QFontMetrics, QIcon, QPainter, QPen, QPixmap
+    QColor, QCursor, QFont, QFontMetrics, QIcon, QPainter, QPainterPath,
+    QPen, QPixmap
 )
 from careeyes_runtime import (
     GammaController, SingleInstance, WindowsActivityMonitor,
@@ -826,6 +827,7 @@ class DesktopPet(QWidget):
     PET_STYLES = {
         "blue_cat": {
             "label": "蓝猫",
+            "tagline": "元气在线，提醒你别盯太久。",
             "palette": _make_palette("#0ea5e9", "#38bdf8", "#e0f2fe"),
             "ears": "cat",
             "tail": "cat",
@@ -833,6 +835,7 @@ class DesktopPet(QWidget):
         },
         "orange_fox": {
             "label": "橘狐",
+            "tagline": "机灵守时，到点就催你歇会儿。",
             "palette": _make_palette("#f97316", "#fdba74", "#fff7ed"),
             "ears": "pointed",
             "tail": "cat",
@@ -840,6 +843,7 @@ class DesktopPet(QWidget):
         },
         "mint_bunny": {
             "label": "薄荷兔",
+            "tagline": "清清爽爽，陪你把节奏慢下来。",
             "palette": _make_palette("#10b981", "#6ee7b7", "#ecfdf5"),
             "ears": "tall",
             "tail": "puff",
@@ -847,6 +851,7 @@ class DesktopPet(QWidget):
         },
         "purple_owl": {
             "label": "紫鸮",
+            "tagline": "夜里也盯着你，别拿熬夜当本事。",
             "palette": _make_palette("#8b5cf6", "#c4b5fd", "#f5f3ff"),
             "ears": "round",
             "tail": "wing",
@@ -854,6 +859,7 @@ class DesktopPet(QWidget):
         },
         "pink_poodle": {
             "label": "粉贵宾",
+            "tagline": "软乎归软乎，休息时间一点不让。",
             "palette": _make_palette("#ec4899", "#f9a8d4", "#fdf2f8"),
             "ears": "round",
             "tail": "puff",
@@ -861,10 +867,39 @@ class DesktopPet(QWidget):
         },
         "charcoal_cat": {
             "label": "夜行猫",
+            "tagline": "安静待命，护眼关闭也会提醒你。",
             "palette": _make_palette("#334155", "#64748b", "#f1f5f9"),
             "ears": "cat",
             "tail": "cat",
             "accessory": "star",
+        },
+        "seagull": {
+            "label": "小海鸥",
+            "tagline": "不催你努力，只提醒你歇会儿。",
+            "renderer": "seagull",
+            "palette": {
+                "idle": ("#f1f6f9", "#d4e2ec", "#ffffff"),
+                "tired": ("#e5edf2", "#c5d5e1", "#f8fafc"),
+                "resting": ("#cad8e3", "#e1eaf1", "#f1f5f9"),
+                "off": ("#64748b", "#94a3b8", "#e2e8f0"),
+            },
+        },
+        "cream_cat": {
+            "label": "奶油猫",
+            "tagline": "暖乎乎陪着你，忙完记得眨眨眼。",
+            "renderer": "cream_cat",
+            "palette": _make_palette("#efc18d", "#d99f68", "#fff0d9"),
+        },
+        "pixel_robot": {
+            "label": "像素机器人",
+            "tagline": "精准计时，休息指令从不掉线。",
+            "renderer": "pixel_robot",
+            "palette": {
+                "idle": ("#add9ec", "#527d99", "#213b52"),
+                "tired": ("#98c6da", "#496f89", "#1e374d"),
+                "resting": ("#789db2", "#a3acc8", "#26334d"),
+                "off": ("#64748b", "#475569", "#1e293b"),
+            },
         },
     }
 
@@ -1017,9 +1052,12 @@ class DesktopPet(QWidget):
 
     # ── 绘制 ──────────────────────────────────
     def paintEvent(self, event):
+        p = QPainter(self)
+        self._paint_scene(p)
+
+    def _paint_scene(self, p, show_bar=True, show_bubble=True):
         style = self.PET_STYLES[self._pet_kind]
         body, light, belly = style["palette"][self._state]
-        p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         bob = math.sin(self._phase) * 3.0 + self._squash * 5
         top = self.BODY_TOP + bob
@@ -1030,33 +1068,316 @@ class DesktopPet(QWidget):
         p.setBrush(QColor(0, 0, 0, 70))
         p.drawEllipse(int(self.W / 2 - sw / 2), 142, sw, 12)
 
-        wag = math.sin(self._phase * 1.7) * 9
-        if style["tail"] == "puff":
-            p.setBrush(QColor(light))
-            p.drawEllipse(112, int(top + 72), 24, 24)
-        elif style["tail"] == "wing":
-            p.setBrush(QColor(light))
-            p.drawEllipse(104, int(top + 65 + wag * 0.3), 34, 17)
+        renderer = style.get("renderer", "classic")
+        if renderer == "seagull":
+            self._paint_seagull(p, top, body, light, belly)
+        elif renderer == "cream_cat":
+            self._paint_cream_cat(p, top, body, light, belly)
+        elif renderer == "pixel_robot":
+            self._paint_pixel_robot(p, top, body, light, belly)
         else:
+            wag = math.sin(self._phase * 1.7) * 9
+            if style["tail"] == "puff":
+                p.setBrush(QColor(light))
+                p.drawEllipse(112, int(top + 72), 24, 24)
+            elif style["tail"] == "wing":
+                p.setBrush(QColor(light))
+                p.drawEllipse(104, int(top + 65 + wag * 0.3), 34, 17)
+            else:
+                p.setBrush(QColor(body))
+                p.drawEllipse(int(106 + wag * 0.5), int(top + 60), 28, 13)
+
+            self._paint_ears(p, top, light, belly, style["ears"])
+
+            p.setPen(Qt.NoPen)
             p.setBrush(QColor(body))
-            p.drawEllipse(int(106 + wag * 0.5), int(top + 60), 28, 13)
+            p.drawRoundedRect(QRect(28, int(top + 8), 94, 90), 34, 34)
+            p.setBrush(QColor(belly))
+            p.drawEllipse(39, int(top + 22), 72, 62)
+            p.setBrush(QColor(body).darker(112))
+            p.drawEllipse(38, int(top + 84), 28, 15)
+            p.drawEllipse(84, int(top + 84), 28, 15)
 
-        self._paint_ears(p, top, light, belly, style["ears"])
+            self._paint_face(p, top)
+            self._paint_accessory(p, top, style["accessory"])
+        if show_bar:
+            self._paint_bar(p)
+        if show_bubble:
+            self._paint_bubble(p)
 
-        # 身体 + 肚皮 + 脚
+    @staticmethod
+    def _fill_path(p, path, fill, stroke=None, width=1.0):
+        p.setBrush(fill if isinstance(fill, QColor) else QColor(fill))
+        if stroke:
+            pen = QPen(QColor(stroke), width)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            p.setPen(pen)
+        else:
+            p.setPen(Qt.NoPen)
+        p.drawPath(path)
+
+    def _paint_rounded_eyes(self, p, centers, eye_y, ink,
+                            eye_width=12, eye_height=18):
+        closed = self._blink > 0 or self._state == "resting"
+        if closed:
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor(ink), 2.5, Qt.SolidLine, Qt.RoundCap))
+            for center_x in centers:
+                p.drawArc(int(center_x - eye_width / 2), int(eye_y + 5),
+                          eye_width, 10, 0, -180 * 16)
+            return
+
+        look_x, look_y = self._look
+        current_height = 11 if self._state == "tired" else eye_height
+        current_y = eye_y + (eye_height - current_height) / 2
+        for center_x in centers:
+            left = center_x - eye_width / 2 + look_x
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(ink))
+            p.drawEllipse(int(left), int(current_y + look_y),
+                          eye_width, current_height)
+            p.setBrush(QColor(255, 255, 255, 235))
+            p.drawEllipse(int(left + 3), int(current_y + 3 + look_y), 4, 5)
+        if self._state == "tired":
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor(ink), 2.5, Qt.SolidLine, Qt.RoundCap))
+            for center_x in centers:
+                p.drawLine(int(center_x - eye_width / 2), int(eye_y + 2),
+                           int(center_x + eye_width / 2), int(eye_y + 1))
+
+    def _paint_sleep_marks(self, p, x, y, color="#c7d2fe"):
+        if self._state != "resting":
+            return
+        font = QFont("Segoe UI")
+        font.setPixelSize(13)
+        font.setBold(True)
+        p.setFont(font)
+        p.setPen(QColor(color))
+        p.drawText(int(x), int(y + math.sin(self._phase) * 2), "z")
+        p.drawText(int(x + 10), int(y - 12 + math.sin(self._phase + 1.2) * 2), "z")
+
+    def _paint_mint_scarf(self, p, center_x, y, width=66):
+        half = width / 2
+        tail = QPainterPath()
+        tail.moveTo(center_x - 13, y + 4)
+        tail.cubicTo(center_x - 14, y + 15, center_x - 10, y + 25,
+                     center_x - 6, y + 32)
+        tail.quadTo(center_x + 2, y + 34, center_x + 8, y + 28)
+        tail.lineTo(center_x + 1, y + 5)
+        tail.closeSubpath()
+        self._fill_path(p, tail, "#3abdb5")
+
+        wrap = QPainterPath()
+        wrap.moveTo(center_x - half, y - 6)
+        wrap.cubicTo(center_x - 13, y + 2, center_x + 14, y + 3,
+                     center_x + half, y - 6)
+        wrap.lineTo(center_x + half - 3, y + 5)
+        wrap.cubicTo(center_x + 12, y + 13, center_x - 14, y + 12,
+                     center_x - half + 3, y + 4)
+        wrap.closeSubpath()
+        self._fill_path(p, wrap, "#72ddd0")
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor("#b7f0e5"), 1.5, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(int(center_x - half + 8), int(y - 3),
+                  int(width - 16), 13, 195 * 16, 150 * 16)
+
+    def _paint_seagull(self, p, top, body, light, belly):
+        flap = math.sin(self._phase * 1.7) * 4
+
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(body))
-        p.drawRoundedRect(QRect(28, int(top + 8), 94, 90), 34, 34)
-        p.setBrush(QColor(belly))
-        p.drawEllipse(39, int(top + 22), 72, 62)
-        p.setBrush(QColor(body).darker(112))
-        p.drawEllipse(38, int(top + 84), 28, 15)
-        p.drawEllipse(84, int(top + 84), 28, 15)
+        p.setBrush(QColor("#edae59"))
+        p.drawEllipse(43, int(top + 91), 29, 14)
+        p.drawEllipse(79, int(top + 91), 29, 14)
 
-        self._paint_face(p, top)
-        self._paint_accessory(p, top, style["accessory"])
-        self._paint_bar(p)
-        self._paint_bubble(p)
+        left_wing = QPainterPath()
+        left_wing.moveTo(42, top + 42)
+        left_wing.cubicTo(24, top + 51 + flap, 24, top + 72 + flap,
+                          41, top + 82)
+        left_wing.cubicTo(49, top + 68, 49, top + 54, 42, top + 42)
+        left_wing.closeSubpath()
+        self._fill_path(p, left_wing, light)
+
+        right_wing = QPainterPath()
+        right_wing.moveTo(108, top + 43)
+        right_wing.cubicTo(124, top + 49 - flap, 130, top + 36 - flap,
+                           128, top + 25 - flap)
+        right_wing.cubicTo(142, top + 43 - flap, 130, top + 68,
+                           110, top + 73)
+        right_wing.cubicTo(105, top + 64, 104, top + 52, 108, top + 43)
+        right_wing.closeSubpath()
+        self._fill_path(p, right_wing, belly, QColor(light).darker(108).name())
+
+        bird = QPainterPath()
+        bird.moveTo(75, top + 2)
+        bird.cubicTo(53, top - 1, 39, top + 16, 37, top + 45)
+        bird.cubicTo(33, top + 73, 44, top + 98, 75, top + 99)
+        bird.cubicTo(107, top + 99, 118, top + 73, 113, top + 45)
+        bird.cubicTo(111, top + 17, 97, top + 2, 75, top + 2)
+        bird.closeSubpath()
+        self._fill_path(p, bird, body, QColor(light).lighter(110).name())
+
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(belly))
+        p.drawEllipse(47, int(top + 31), 57, 58)
+
+        stem_pen = QPen(QColor("#499d75"), 3, Qt.SolidLine, Qt.RoundCap)
+        p.setPen(stem_pen)
+        p.drawLine(75, int(top + 4), 76, int(top - 12))
+        leaf = QPainterPath()
+        leaf.moveTo(75, top - 6)
+        leaf.cubicTo(63, top - 6, 59, top - 13, 60, top - 17)
+        leaf.cubicTo(69, top - 18, 75, top - 14, 75, top - 6)
+        leaf.closeSubpath()
+        self._fill_path(p, leaf, "#90d3a2")
+        leaf = QPainterPath()
+        leaf.moveTo(76, top - 9)
+        leaf.cubicTo(77, top - 18, 86, top - 23, 92, top - 21)
+        leaf.cubicTo(93, top - 14, 87, top - 8, 76, top - 9)
+        leaf.closeSubpath()
+        self._fill_path(p, leaf, "#b0e4b2")
+
+        self._paint_rounded_eyes(p, (59, 91), top + 31, "#1b3143", 11, 17)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(240, 154, 153, 145))
+        p.drawEllipse(42, int(top + 52), 15, 8)
+        p.drawEllipse(94, int(top + 52), 15, 8)
+        beak = QPainterPath()
+        beak.moveTo(66, top + 49)
+        beak.quadTo(75, top + 42, 84, top + 49)
+        beak.quadTo(81, top + 59, 75, top + 61)
+        beak.quadTo(69, top + 59, 66, top + 49)
+        beak.closeSubpath()
+        self._fill_path(p, beak, "#f8ba62")
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor("#d68d42"), 1.2, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(68, int(top + 47), 14, 8, 200 * 16, 140 * 16)
+
+        self._paint_mint_scarf(p, 75, top + 69)
+        self._paint_sleep_marks(p, 116, top + 29)
+
+    def _paint_cream_cat(self, p, top, body, light, belly):
+        wag = math.sin(self._phase * 1.7) * 5
+        tail = QPainterPath()
+        tail.moveTo(106, top + 75)
+        tail.cubicTo(137, top + 86 + wag, 139, top + 49 + wag,
+                     119, top + 48)
+        tail_pen = QPen(QColor(light), 14, Qt.SolidLine, Qt.RoundCap)
+        p.setPen(tail_pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(tail)
+
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(light))
+        p.drawEllipse(42, int(top + 91), 30, 14)
+        p.drawEllipse(79, int(top + 91), 30, 14)
+
+        cat = QPainterPath()
+        cat.moveTo(37, top + 35)
+        cat.lineTo(37, top + 2)
+        cat.quadTo(39, top - 9, 55, top + 7)
+        cat.quadTo(75, top, 95, top + 7)
+        cat.quadTo(111, top - 9, 113, top + 2)
+        cat.lineTo(113, top + 35)
+        cat.cubicTo(122, top + 69, 109, top + 99, 75, top + 99)
+        cat.cubicTo(41, top + 99, 28, top + 69, 37, top + 35)
+        cat.closeSubpath()
+        self._fill_path(p, cat, body)
+
+        for direction in (-1, 1):
+            ear = QPainterPath()
+            ear.moveTo(75 + direction * 38, top + 1)
+            ear.lineTo(75 + direction * 20, top + 19)
+            ear.lineTo(75 + direction * 37, top + 22)
+            ear.closeSubpath()
+            self._fill_path(p, ear, "#e9ac9a")
+
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(belly))
+        p.drawEllipse(44, int(top + 30), 62, 60)
+        stripe = QColor(light).darker(105)
+        p.setBrush(stripe)
+        for x, height in ((55, 14), (70, 19), (85, 14)):
+            p.drawRoundedRect(x, int(top + 15), 8, height, 4, 4)
+
+        self._paint_rounded_eyes(p, (60, 90), top + 39, "#493b39", 11, 16)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(239, 182, 165, 170))
+        p.drawEllipse(42, int(top + 58), 15, 8)
+        p.drawEllipse(94, int(top + 58), 15, 8)
+        nose = QPainterPath()
+        nose.moveTo(69, top + 57)
+        nose.quadTo(75, top + 53, 81, top + 57)
+        nose.lineTo(75, top + 63)
+        nose.closeSubpath()
+        self._fill_path(p, nose, "#b7736b")
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor("#745248"), 1.8, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(61, int(top + 58), 14, 13, 210 * 16, 120 * 16)
+        p.drawArc(75, int(top + 58), 14, 13, 210 * 16, 120 * 16)
+
+        self._paint_mint_scarf(p, 75, top + 70)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#f6d274"))
+        p.drawEllipse(70, int(top + 78), 10, 10)
+        self._paint_sleep_marks(p, 116, top + 28, "#a78bfa")
+
+    def _paint_pixel_robot(self, p, top, body, light, belly):
+        y = int(top - 8)
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing, False)
+
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(light).darker(112))
+        p.drawRect(72, y - 8, 7, 14)
+        p.setBrush(QColor("#b8a6f1") if self._state != "off" else QColor("#94a3b8"))
+        p.drawRect(68, y - 13, 15, 8)
+
+        p.setBrush(QColor(light).darker(105))
+        p.drawRect(24, y + 15, 10, 28)
+        p.drawRect(116, y + 15, 10, 28)
+        p.setBrush(QColor(body))
+        p.drawRect(31, y, 88, 58)
+        p.setBrush(QColor(body).lighter(122))
+        p.drawRect(35, y + 4, 80, 5)
+        p.setBrush(QColor(belly))
+        p.drawRect(40, y + 13, 70, 34)
+
+        eye = QColor("#87eee1") if self._state != "off" else QColor("#94a3b8")
+        p.setBrush(eye)
+        closed = self._blink > 0 or self._state == "resting"
+        if closed:
+            p.drawRect(50, y + 29, 13, 3)
+            p.drawRect(87, y + 29, 13, 3)
+        else:
+            eye_height = 6 if self._state == "tired" else 10
+            eye_y = y + (24 if self._state == "tired" else 21)
+            look_x = int(round(self._look[0] / 2))
+            look_y = int(round(self._look[1] / 2))
+            p.drawRect(51 + look_x, eye_y + look_y, 11, eye_height)
+            p.drawRect(88 + look_x, eye_y + look_y, 11, eye_height)
+        p.drawRect(66, y + 38, 18, 3)
+
+        p.setBrush(QColor(body).darker(112))
+        p.drawRect(45, y + 66, 60, 43)
+        p.setBrush(QColor(light))
+        p.drawRect(52, y + 73, 46, 27)
+        p.setBrush(QColor(body))
+        p.drawRect(32, y + 69, 10, 31)
+        p.drawRect(108, y + 69, 10, 31)
+
+        heart = QColor("#fac2c0") if self._state != "off" else QColor("#94a3b8")
+        p.setBrush(heart)
+        for pixel_x, pixel_y in ((69, 80), (76, 80), (64, 85), (69, 85),
+                                 (76, 85), (81, 85), (69, 90), (76, 90),
+                                 (72, 95)):
+            p.drawRect(pixel_x, y + pixel_y, 5, 5)
+
+        p.setBrush(QColor(light).darker(108))
+        p.drawRect(49, y + 109, 23, 10)
+        p.drawRect(78, y + 109, 23, 10)
+        p.restore()
+        self._paint_sleep_marks(p, 119, top + 22, "#b8a6f1")
 
     def _paint_ears(self, p, top, light, belly, ear_style):
         p.setPen(Qt.NoPen)
@@ -1264,6 +1585,106 @@ class DesktopPet(QWidget):
                 cb()
 
 
+class PetPreview(DesktopPet):
+    """复用桌宠 renderer 的嵌入式预览，不创建桌面窗口。"""
+
+    def __init__(self, pet_kind, parent=None, animated=True, halo=True):
+        QWidget.__init__(self, parent)
+        self._pet_kind = (pet_kind if pet_kind in self.PET_STYLES
+                          else self.DEFAULT_PET_KIND)
+        self._state = "idle"
+        self._phase = 0.35
+        self._blink = 0
+        self._next_blink = 55
+        self._squash = 0.0
+        self._look = (0.0, 0.0)
+        self._left_secs = 0
+        self._total_secs = 0
+        self._msg = ""
+        self._halo = halo
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setStyleSheet("background:transparent;border:none;")
+
+        self._preview_timer = QTimer(self)
+        self._preview_timer.timeout.connect(self._tick_preview)
+        if animated:
+            self._preview_timer.start(80)
+
+    def _tick_preview(self):
+        self._phase += 0.08
+        if self._blink > 0:
+            self._blink -= 1
+        else:
+            self._next_blink -= 1
+            if self._next_blink <= 0:
+                self._blink = 3
+                self._next_blink = 55 + int(abs(math.sin(self._phase)) * 40)
+        self.update()
+
+    def set_pet_kind(self, pet_kind):
+        if pet_kind in self.PET_STYLES and pet_kind != self._pet_kind:
+            self._pet_kind = pet_kind
+            self.update()
+
+    def set_state(self, state):
+        if state in self.PET_STYLES[self._pet_kind]["palette"]:
+            self._state = state
+            self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        if self._halo:
+            side = min(self.width(), self.height()) - 12
+            halo = QRect((self.width() - side) // 2,
+                         (self.height() - side) // 2, side, side)
+            p.setPen(QPen(QColor(76, 172, 184, 45), 1))
+            p.setBrush(QColor(56, 126, 145, 18))
+            p.drawEllipse(halo)
+            inner = halo.adjusted(18, 18, -18, -18)
+            p.setPen(QPen(QColor(76, 172, 184, 28), 1))
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(inner)
+
+        available_width = max(1, self.width() - (22 if self._halo else 4))
+        available_height = max(1, self.height() - (12 if self._halo else 2))
+        scale = min(available_width / self.W, available_height / self.H)
+        draw_width = self.W * scale
+        draw_height = self.H * scale
+        p.translate((self.width() - draw_width) / 2,
+                    (self.height() - draw_height) / 2)
+        p.scale(scale, scale)
+        self._paint_scene(p, show_bar=False, show_bubble=False)
+
+
+class PetSkinCard(QPushButton):
+    def __init__(self, pet_kind, info, parent=None):
+        super().__init__(parent)
+        self.pet_kind = pet_kind
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumWidth(92)
+        self.setFixedHeight(82)
+        self.setStyleSheet("""
+            QPushButton { background:#172232; border:1px solid #273649;
+                border-radius:10px; }
+            QPushButton:hover { background:#1b2a3c; border-color:#3b5368; }
+            QPushButton:checked { background:#18343c; border:1px solid #60d8ce; }
+        """)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(5, 3, 5, 5)
+        layout.setSpacing(0)
+        preview = PetPreview(pet_kind, self, animated=False, halo=False)
+        preview.setFixedHeight(58)
+        layout.addWidget(preview)
+        label = QLabel(info["label"])
+        label.setAlignment(Qt.AlignCenter)
+        label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        label.setStyleSheet("background:transparent;border:none;color:#b8c5d5;font-size:11px;")
+        layout.addWidget(label)
+
+
 class CareEyesApp(QWidget):
     hotkey_brightness = pyqtSignal(int)
     hotkey_temperature = pyqtSignal(int)
@@ -1403,16 +1824,8 @@ class CareEyesApp(QWidget):
         self.pet_kind = pet_kind
         if self.pet is not None:
             self.pet.set_pet_kind(pet_kind)
-        if hasattr(self, "pet_style_combo"):
-            index = self.pet_style_combo.findData(pet_kind)
-            if index >= 0:
-                self.pet_style_combo.blockSignals(True)
-                self.pet_style_combo.setCurrentIndex(index)
-                self.pet_style_combo.blockSignals(False)
+        self._sync_pet_page()
         self._schedule_save()
-
-    def _on_pet_kind_selected(self, index):
-        self._set_pet_kind(self.pet_style_combo.itemData(index))
 
     def _open_main(self):
         self.show()
@@ -1425,17 +1838,10 @@ class CareEyesApp(QWidget):
 
     def _pet_state(self):
         """根据当前护眼/休息状态推导桌宠表情。"""
-        if self.pet is None:
-            return
-        if not self.is_enabled:
-            state = "off"
-        elif self.overlay is not None and self.overlay.isVisible():
-            state = "resting"
-        elif self._next_rest_secs <= 60:
-            state = "tired"
-        else:
-            state = "idle"
-        self.pet.set_state(state)
+        state = self._current_pet_state()
+        if self.pet is not None:
+            self.pet.set_state(state)
+        self._sync_pet_page()
 
     def _on_pet_toggle(self, state):
         self.pet_enabled = bool(state)
@@ -1447,11 +1853,87 @@ class CareEyesApp(QWidget):
             self.pet_action.blockSignals(True)
             self.pet_action.setChecked(self.pet_enabled)
             self.pet_action.blockSignals(False)
-        if hasattr(self, "pet_cb"):
-            self.pet_cb.blockSignals(True)
-            self.pet_cb.setChecked(self.pet_enabled)
-            self.pet_cb.blockSignals(False)
+        self._sync_pet_page()
         self._schedule_save()
+
+    def _current_pet_state(self):
+        if not self.is_enabled:
+            return "off"
+        if self.overlay is not None and self.overlay.isVisible():
+            return "resting"
+        if self._next_rest_secs <= 60:
+            return "tired"
+        return "idle"
+
+    def _sync_pet_page(self):
+        controls = vars(self)
+        pet_enable_toggle = controls.get("pet_enable_toggle")
+        if pet_enable_toggle is not None:
+            pet_enable_toggle.blockSignals(True)
+            pet_enable_toggle.setChecked(self.pet_enabled)
+            pet_enable_toggle.blockSignals(False)
+        pet_status_label = controls.get("pet_status_label")
+        if pet_status_label is not None:
+            pet_status_label.setText(
+                "桌宠已开启" if self.pet_enabled else "桌宠已关闭"
+            )
+            color = "#a3e1d7" if self.pet_enabled else "#6e7681"
+            pet_status_label.setStyleSheet(
+                f"color:{color};font-size:12px;background:transparent;"
+            )
+        pet_visibility_button = controls.get("pet_visibility_button")
+        if pet_visibility_button is not None:
+            pet_visibility_button.setText(
+                "✓  正在使用" if self.pet_enabled else "显示桌宠"
+            )
+        pet_preview = controls.get("pet_preview")
+        if pet_preview is not None:
+            pet_preview.set_pet_kind(self.pet_kind)
+            state = self._current_pet_state()
+            pet_preview.set_state(state)
+        pet_name_label = controls.get("pet_name_label")
+        if pet_name_label is not None:
+            info = DesktopPet.PET_STYLES[self.pet_kind]
+            pet_name_label.setText(info["label"])
+            controls["pet_tagline_label"].setText(info["tagline"])
+        pet_skin_buttons = controls.get("pet_skin_buttons")
+        if pet_skin_buttons is not None:
+            for pet_kind, button in pet_skin_buttons.items():
+                button.blockSignals(True)
+                button.setChecked(pet_kind == self.pet_kind)
+                button.blockSignals(False)
+        pet_mood_label = controls.get("pet_mood_label")
+        if pet_mood_label is not None:
+            state = self._current_pet_state()
+            mood_text = {
+                "idle": "精神在线",
+                "tired": "该歇会儿了",
+                "resting": "一起休息中",
+                "off": "护眼已暂停",
+            }[state]
+            speech = {
+                "idle": "再忙，也要给眼睛放个小假。",
+                "tired": "快到休息时间啦，收个尾。",
+                "resting": "闭上眼睛，放松一会儿。",
+                "off": "护眼已关闭，别熬太久。",
+            }[state]
+            pet_mood_label.setText(mood_text)
+            controls["pet_speech_label"].setText(speech)
+            if not self.is_enabled:
+                controls["pet_next_rest_label"].setText("休息计时当前已暂停")
+                progress = 0
+            elif self.overlay is not None and self.overlay.isVisible():
+                controls["pet_next_rest_label"].setText("休息结束后重新开始计时")
+                progress = 100
+            else:
+                minutes, seconds = divmod(max(0, self._next_rest_secs), 60)
+                controls["pet_next_rest_label"].setText(
+                    f"距离下次休息 {minutes:02d}:{seconds:02d}"
+                )
+                total = (5 * 60 if self._rest_deferred
+                         else self.rest_interval_min * 60)
+                progress = int(100 * (1 - self._next_rest_secs / max(1, total)))
+            controls["pet_page_progress"].setValue(max(0, min(100, progress)))
 
     # ══════════════════════════════════════════
     def init_hotkeys(self):
@@ -1497,15 +1979,16 @@ class CareEyesApp(QWidget):
     # ══════════════════════════════════════════
     def init_ui(self):
         self.setWindowTitle(APP_TITLE)
-        self.setMinimumSize(660, 460)
-        self.resize(700, 500)
+        self.setMinimumSize(760, 560)
+        self.resize(860, 640)
         self.setStyleSheet(self._qss())
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0,0,0,0); root.setSpacing(0)
         root.addWidget(self._build_header())
         self.pages = QStackedWidget()
-        for fn in [self._page_home, self._page_timer, self._page_stats, self._page_settings]:
+        for fn in [self._page_home, self._page_timer, self._page_stats,
+                   self._page_pet, self._page_settings]:
             self.pages.addWidget(fn())
         root.addWidget(self.pages, 1)
 
@@ -1565,7 +2048,7 @@ class CareEyesApp(QWidget):
         lay.addWidget(brand)
 
         self.nav_btns = []
-        for label in ["护眼", "休息", "统计", "设置"]:
+        for label in ["护眼", "休息", "统计", "桌宠", "设置"]:
             btn = QPushButton(label)
             btn.setCheckable(True); btn.setFixedSize(66, 32)
             ac = self._accent
@@ -1826,6 +2309,191 @@ class CareEyesApp(QWidget):
     # ══════════════════════════════════════════
     #  Page 3
     # ══════════════════════════════════════════
+    def _page_pet(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(24, 18, 24, 18)
+        lay.setSpacing(12)
+
+        heading = QHBoxLayout()
+        title_box = QVBoxLayout()
+        title_box.setSpacing(3)
+        title_box.addWidget(self._h2("给休息，找个小搭子。"))
+        subtitle = QLabel("认真工作，也好好休息。让每一次放松，都有个小家伙陪着。")
+        subtitle.setStyleSheet("color:#8295ac;font-size:12px;")
+        title_box.addWidget(subtitle)
+        heading.addLayout(title_box)
+        heading.addStretch()
+
+        status_pill = QFrame()
+        status_pill.setStyleSheet(
+            "background:#132a30;border:1px solid #254147;border-radius:18px;"
+        )
+        status_layout = QHBoxLayout(status_pill)
+        status_layout.setContentsMargins(14, 4, 9, 4)
+        status_layout.setSpacing(9)
+        status_dot = QLabel("●")
+        status_dot.setStyleSheet(
+            f"color:{self._accent};font-size:10px;background:transparent;border:none;"
+        )
+        self.pet_status_label = QLabel()
+        self.pet_enable_toggle = AnimatedToggle()
+        self.pet_enable_toggle.setChecked(self.pet_enabled)
+        self.pet_enable_toggle.clicked.connect(self._on_pet_toggle)
+        status_layout.addWidget(status_dot)
+        status_layout.addWidget(self.pet_status_label)
+        status_layout.addWidget(self.pet_enable_toggle)
+        heading.addWidget(status_pill)
+        lay.addLayout(heading)
+
+        content = QHBoxLayout()
+        content.setSpacing(12)
+
+        hero = QFrame()
+        hero.setObjectName("petHero")
+        hero.setStyleSheet(
+            "QFrame#petHero{background:#152638;border:1px solid #2b4252;"
+            "border-radius:14px;}"
+        )
+        hero_layout = QVBoxLayout(hero)
+        hero_layout.setContentsMargins(16, 12, 16, 13)
+        hero_layout.setSpacing(5)
+
+        hero_top = QHBoxLayout()
+        hero_caption = QLabel("正在陪伴你")
+        hero_caption.setStyleSheet("color:#b4c6d5;font-size:12px;background:transparent;")
+        hero_badge = QLabel("桌面预览")
+        hero_badge.setAlignment(Qt.AlignCenter)
+        hero_badge.setStyleSheet(
+            "color:#a0b5c5;background:#213748;border-radius:10px;"
+            "padding:3px 10px;font-size:10px;"
+        )
+        hero_top.addWidget(hero_caption)
+        hero_top.addStretch()
+        hero_top.addWidget(hero_badge)
+        hero_layout.addLayout(hero_top)
+
+        self.pet_speech_label = QLabel("再忙，也要给眼睛放个小假。")
+        self.pet_speech_label.setAlignment(Qt.AlignCenter)
+        self.pet_speech_label.setWordWrap(True)
+        self.pet_speech_label.setStyleSheet(
+            "color:#d8eee8;background:#28434c;border:1px solid #3c5c62;"
+            "border-radius:11px;padding:7px;font-size:12px;"
+        )
+        hero_layout.addWidget(self.pet_speech_label)
+
+        self.pet_preview = PetPreview(self.pet_kind, hero, animated=True, halo=True)
+        self.pet_preview.setMinimumSize(300, 250)
+        self.pet_preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        hero_layout.addWidget(self.pet_preview, 1)
+
+        pet_info = QHBoxLayout()
+        pet_text = QVBoxLayout()
+        pet_text.setSpacing(2)
+        self.pet_name_label = QLabel()
+        self.pet_name_label.setStyleSheet(
+            "color:#edf4ff;font-size:20px;font-weight:700;background:transparent;"
+        )
+        self.pet_tagline_label = QLabel()
+        self.pet_tagline_label.setWordWrap(True)
+        self.pet_tagline_label.setStyleSheet(
+            "color:#92a9ba;font-size:11px;background:transparent;"
+        )
+        pet_text.addWidget(self.pet_name_label)
+        pet_text.addWidget(self.pet_tagline_label)
+        pet_info.addLayout(pet_text, 1)
+        self.pet_visibility_button = QPushButton()
+        self.pet_visibility_button.setFixedSize(112, 38)
+        self.pet_visibility_button.setCursor(Qt.PointingHandCursor)
+        self.pet_visibility_button.setStyleSheet(
+            "QPushButton{background:#60d8ce;color:#0c343b;border:none;"
+            "border-radius:9px;font-weight:700;}"
+            "QPushButton:hover{background:#7ce6dc;}"
+        )
+        self.pet_visibility_button.clicked.connect(
+            lambda: self._on_pet_toggle(not self.pet_enabled)
+        )
+        pet_info.addWidget(self.pet_visibility_button, 0, Qt.AlignBottom)
+        hero_layout.addLayout(pet_info)
+        content.addWidget(hero, 5)
+
+        side = QVBoxLayout()
+        side.setSpacing(12)
+        skin_card = self._card()
+        skin_layout = QVBoxLayout(skin_card)
+        skin_layout.setContentsMargins(13, 10, 13, 12)
+        skin_layout.setSpacing(7)
+        skin_head = QHBoxLayout()
+        skin_head.setContentsMargins(0, 0, 0, 0)
+        skin_title = QLabel("选择你的搭子")
+        skin_title.setFixedHeight(22)
+        skin_title.setStyleSheet(
+            "color:#edf4ff;font-size:14px;font-weight:700;"
+            "background:transparent;border:none;"
+        )
+        skin_count = QLabel(f"{len(DesktopPet.PET_STYLES)} 款外观")
+        skin_count.setFixedHeight(22)
+        skin_count.setStyleSheet(
+            "color:#8295ac;font-size:10px;background:transparent;border:none;"
+        )
+        skin_head.addWidget(skin_title)
+        skin_head.addStretch()
+        skin_head.addWidget(skin_count)
+        skin_layout.addLayout(skin_head)
+
+        skin_grid = QGridLayout()
+        skin_grid.setContentsMargins(0, 0, 0, 0)
+        skin_grid.setHorizontalSpacing(7)
+        skin_grid.setVerticalSpacing(7)
+        self.pet_skin_buttons = {}
+        for index, (pet_kind, info) in enumerate(DesktopPet.PET_STYLES.items()):
+            button = PetSkinCard(pet_kind, info, skin_card)
+            button.clicked.connect(
+                lambda _, kind=pet_kind: self._select_pet_skin(kind)
+            )
+            self.pet_skin_buttons[pet_kind] = button
+            skin_grid.addWidget(button, index // 3, index % 3)
+        for column in range(3):
+            skin_grid.setColumnStretch(column, 1)
+        skin_layout.addLayout(skin_grid)
+        skin_layout.setStretch(0, 0)
+        skin_layout.setStretch(1, 1)
+        side.addWidget(skin_card, 1)
+
+        companion = self._card()
+        companion_layout = QVBoxLayout(companion)
+        companion_layout.setContentsMargins(14, 10, 14, 11)
+        companion_layout.setSpacing(5)
+        companion_head = QHBoxLayout()
+        companion_title = QLabel("陪伴状态")
+        companion_title.setStyleSheet("color:#edf4ff;font-weight:700;")
+        self.pet_mood_label = QLabel()
+        self.pet_mood_label.setStyleSheet("color:#60d8ce;font-size:11px;")
+        companion_head.addWidget(companion_title)
+        companion_head.addStretch()
+        companion_head.addWidget(self.pet_mood_label)
+        companion_layout.addLayout(companion_head)
+        self.pet_next_rest_label = QLabel()
+        self.pet_next_rest_label.setStyleSheet("color:#9fb0c3;font-size:11px;")
+        companion_layout.addWidget(self.pet_next_rest_label)
+        self.pet_page_progress = QProgressBar()
+        self.pet_page_progress.setRange(0, 100)
+        self.pet_page_progress.setTextVisible(False)
+        companion_layout.addWidget(self.pet_page_progress)
+        side.addWidget(companion)
+        content.addLayout(side, 4)
+        lay.addLayout(content, 1)
+
+        self._sync_pet_page()
+        return page
+
+    def _select_pet_skin(self, pet_kind):
+        self._set_pet_kind(pet_kind)
+        self._sync_pet_page()
+
+    # ══════════════════════════════════════════
+    #  Page 4
+    # ══════════════════════════════════════════
     def _page_settings(self):
         page = QWidget(); lay = QVBoxLayout(page)
         lay.setContentsMargins(24,20,24,20); lay.setSpacing(12)
@@ -1837,7 +2505,6 @@ class CareEyesApp(QWidget):
         for row_lbl, attr, default in [
             ("开机自动启动","autostart_cb",self.autostart),
             ("声音提示",   "sound_cb",    self.sound_enabled),
-            ("桌面宠物",   "pet_cb",      self.pet_enabled),
             ("强制休息（前10秒锁定跳过）","force_rest_cb", self.force_rest),
         ]:
             row = QHBoxLayout(); row.addWidget(QLabel(row_lbl))
@@ -1847,21 +2514,7 @@ class CareEyesApp(QWidget):
 
         self.autostart_cb.stateChanged.connect(self._on_autostart_change)
         self.sound_cb.stateChanged.connect(self._on_sound_toggle)
-        self.pet_cb.stateChanged.connect(self._on_pet_toggle)
         self.force_rest_cb.stateChanged.connect(self._on_force_rest_toggle)
-
-        pet_style_row = QHBoxLayout()
-        pet_style_row.addWidget(QLabel("宠物形象"))
-        self.pet_style_combo = QComboBox()
-        for pet_kind, info in DesktopPet.PET_STYLES.items():
-            self.pet_style_combo.addItem(info["label"], pet_kind)
-        self.pet_style_combo.setCurrentIndex(
-            self.pet_style_combo.findData(self.pet_kind))
-        self.pet_style_combo.currentIndexChanged.connect(self._on_pet_kind_selected)
-        pet_style_row.addStretch()
-        pet_style_row.addWidget(self.pet_style_combo)
-        cl.addLayout(pet_style_row)
-        cl.addWidget(self._div())
 
         hk = QLabel("全局快捷键\n"
                     "Ctrl+Alt+↑/↓  亮度 ±5%\n"
@@ -1907,7 +2560,7 @@ class CareEyesApp(QWidget):
             if label is None: menu.addSeparator()
             else:
                 a=QAction(label,self); a.triggered.connect(slot); menu.addAction(a)
-        # 桌宠开关（与设置页复选框同步）
+        # 桌宠开关（与桌宠功能页同步）
         self.pet_action = QAction("显示桌宠", self, checkable=True)
         self.pet_action.setChecked(self.pet_enabled)
         self.pet_action.toggled.connect(self._on_pet_toggle)
@@ -1997,6 +2650,7 @@ class CareEyesApp(QWidget):
         for i,btn in enumerate(self.nav_btns): btn.setChecked(i==idx)
         self.pages.setCurrentIndex(idx)
         if idx == 2: self._refresh_stats()
+        elif idx == 3: self._sync_pet_page()
 
     def on_slider_change(self):
         self.temp = self.temp_slider.value()
@@ -2167,7 +2821,7 @@ class CareEyesApp(QWidget):
         self._refresh_countdown_label()
         if self.pet is not None:
             self.pet.set_countdown(self._next_rest_secs, self.rest_interval_min * 60)
-            self.pet.set_state("resting")
+        self._pet_state()
 
     def _on_overlay_closed(self):
         self._sync_work_clock()
@@ -2184,6 +2838,7 @@ class CareEyesApp(QWidget):
         if self._work_clock.active and self._next_rest_secs == 0:
             self._on_rest_trigger()
         self._refresh_countdown_label()
+        self._sync_pet_page()
         if self.today_minutes != previous_minutes:
             self._refresh_today_summary()
         if self.pet is not None:
@@ -2390,7 +3045,7 @@ class CareEyesApp(QWidget):
         widgets = [self.temp_slider, self.bright_slider, self.interval_spin,
                    self.duration_spin, self.auto_toggle, self.dim_toggle,
                    self.dim_slider, self.force_rest_cb, self.sound_cb,
-                   self.pet_cb, self.autostart_cb, self.pet_style_combo]
+                   self.pet_enable_toggle, self.autostart_cb]
         for widget in widgets:
             widget.blockSignals(True)
         try:
@@ -2416,9 +3071,7 @@ class CareEyesApp(QWidget):
             self.dim_slider.setEnabled(False)
             self.force_rest_cb.setChecked(False)
             self.sound_cb.setChecked(True)
-            self.pet_cb.setChecked(True)
-            self.pet_style_combo.setCurrentIndex(
-                self.pet_style_combo.findData(self.pet_kind))
+            self.pet_enable_toggle.setChecked(True)
             self.autostart_cb.setChecked(False)
         finally:
             for widget in widgets:

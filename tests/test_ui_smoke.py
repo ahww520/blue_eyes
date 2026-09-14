@@ -100,23 +100,57 @@ class OffscreenUiTests(unittest.TestCase):
         self.assertTrue(self.window.is_enabled)
 
     def test_pet_styles_change_and_persist(self):
+        expected_new_styles = {
+            "seagull": "小海鸥",
+            "cream_cat": "奶油猫",
+            "pixel_robot": "像素机器人",
+        }
+        self.assertEqual(self.window.pages.count(), 5)
+        self.assertEqual(
+            [button.text() for button in self.window.nav_btns],
+            ["护眼", "休息", "统计", "桌宠", "设置"],
+        )
+        self.assertFalse(hasattr(self.window, "pet_cb"))
+        self.assertFalse(hasattr(self.window, "pet_style_combo"))
+        self.assertGreaterEqual(len(mainpro.DesktopPet.PET_STYLES), 9)
+        self.assertEqual(
+            set(self.window.pet_skin_buttons),
+            set(mainpro.DesktopPet.PET_STYLES),
+        )
+        for pet_kind, label in expected_new_styles.items():
+            self.assertEqual(
+                mainpro.DesktopPet.PET_STYLES[pet_kind]["label"], label
+            )
+
         self.assertEqual(self.window.pet_kind, "mint_bunny")
         self.assertEqual(self.window.pet._pet_kind, "mint_bunny")
-        self.assertEqual(self.window.pet_style_combo.currentData(), "mint_bunny")
+        self.assertTrue(self.window.pet_skin_buttons["mint_bunny"].isChecked())
+        self.assertEqual(self.window.pet_preview._pet_kind, "mint_bunny")
 
-        self.window._set_pet_kind("orange_fox")
-        self.assertEqual(self.window.pet._pet_kind, "orange_fox")
-        self.assertEqual(self.window.pet_style_combo.currentData(), "orange_fox")
+        self.window.pet_skin_buttons["pixel_robot"].click()
+        self.assertEqual(self.window.pet._pet_kind, "pixel_robot")
+        self.assertEqual(self.window.pet_preview._pet_kind, "pixel_robot")
+        self.assertTrue(self.window.pet_skin_buttons["pixel_robot"].isChecked())
+        self.assertEqual(self.window.pet_name_label.text(), "像素机器人")
+
+        self.window.pet_enable_toggle.click()
+        self.assertTrue(self.window.pet_enabled)
+        self.assertTrue(self.window.pet.isVisible())
+        self.assertEqual(self.window.pet_status_label.text(), "桌宠已开启")
         self.window._save_settings()
 
         with open(self.config_path, encoding="utf-8") as handle:
             saved = json.load(handle)
-        self.assertEqual(saved["pet_kind"], "orange_fox")
+        self.assertEqual(saved["pet_kind"], "pixel_robot")
+        self.assertTrue(saved["pet_enabled"])
 
         for pet_kind in mainpro.DesktopPet.PET_STYLES:
             pet = mainpro.DesktopPet(pet_kind=pet_kind)
-            pet.show()
-            self.assertFalse(pet.grab().isNull())
+            for state in ("idle", "tired", "resting", "off"):
+                pet._state = state
+                pet.show()
+                self.application.processEvents()
+                self.assertFalse(pet.grab().isNull(), f"{pet_kind}:{state}")
             pet._anim_timer.stop()
             pet._chat_timer.stop()
             pet._msg_timer.stop()
