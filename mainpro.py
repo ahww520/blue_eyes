@@ -37,7 +37,7 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QLabel,
     QSlider, QHBoxLayout, QFrame, QStackedWidget, QSpinBox,
     QSystemTrayIcon, QMenu, QAction, QCheckBox, QGraphicsDropShadowEffect,
-    QSizePolicy, QGridLayout, QProgressBar, QMessageBox
+    QSizePolicy, QGridLayout, QProgressBar, QMessageBox, QComboBox
 )
 from PyQt5.QtCore import (
     Qt, QTimer, QRect, pyqtSignal, QObject
@@ -811,12 +811,61 @@ class DesktopPet(QWidget):
     W, H = 150, 168
     BODY_TOP = 36
 
-    # state: (主体色, 高光色, 肚皮色)
-    PALETTE = {
-        "idle":    ("#0ea5e9", "#38bdf8", "#e0f2fe"),
-        "tired":   ("#f59e0b", "#fbbf24", "#fef3c7"),
-        "resting": ("#6366f1", "#818cf8", "#e0e7ff"),
-        "off":     ("#475569", "#64748b", "#e2e8f0"),
+    DEFAULT_PET_KIND = "blue_cat"
+
+    @staticmethod
+    def _make_palette(primary, highlight, belly):
+        base = QColor(primary)
+        return {
+            "idle": (primary, highlight, belly),
+            "tired": (base.darker(112).name(), highlight, belly),
+            "resting": (base.darker(126).name(), base.lighter(145).name(), belly),
+            "off": ("#475569", "#64748b", "#e2e8f0"),
+        }
+
+    PET_STYLES = {
+        "blue_cat": {
+            "label": "蓝猫",
+            "palette": _make_palette("#0ea5e9", "#38bdf8", "#e0f2fe"),
+            "ears": "cat",
+            "tail": "cat",
+            "accessory": "bell",
+        },
+        "orange_fox": {
+            "label": "橘狐",
+            "palette": _make_palette("#f97316", "#fdba74", "#fff7ed"),
+            "ears": "pointed",
+            "tail": "cat",
+            "accessory": "leaf",
+        },
+        "mint_bunny": {
+            "label": "薄荷兔",
+            "palette": _make_palette("#10b981", "#6ee7b7", "#ecfdf5"),
+            "ears": "tall",
+            "tail": "puff",
+            "accessory": "bow",
+        },
+        "purple_owl": {
+            "label": "紫鸮",
+            "palette": _make_palette("#8b5cf6", "#c4b5fd", "#f5f3ff"),
+            "ears": "round",
+            "tail": "wing",
+            "accessory": "glasses",
+        },
+        "pink_poodle": {
+            "label": "粉贵宾",
+            "palette": _make_palette("#ec4899", "#f9a8d4", "#fdf2f8"),
+            "ears": "round",
+            "tail": "puff",
+            "accessory": "bow",
+        },
+        "charcoal_cat": {
+            "label": "夜行猫",
+            "palette": _make_palette("#334155", "#64748b", "#f1f5f9"),
+            "ears": "cat",
+            "tail": "cat",
+            "accessory": "star",
+        },
     }
 
     TIPS = {
@@ -828,7 +877,8 @@ class DesktopPet(QWidget):
     }
 
     def __init__(self, open_app=None, hide_pet=None, quit_app=None,
-                 rest_now=None, toggle_care=None, on_moved=None):
+                 rest_now=None, toggle_care=None, on_moved=None,
+                 pet_kind=DEFAULT_PET_KIND):
         super().__init__(None)
         self._open_app    = open_app
         self._hide_pet    = hide_pet
@@ -836,6 +886,7 @@ class DesktopPet(QWidget):
         self._rest_now    = rest_now
         self._toggle_care = toggle_care
         self._on_moved    = on_moved
+        self._pet_kind = pet_kind if pet_kind in self.PET_STYLES else self.DEFAULT_PET_KIND
 
         self._state = "idle"
         self._phase = 0.0
@@ -907,11 +958,20 @@ class DesktopPet(QWidget):
 
     # ── 与主程序联动 ──────────────────────────
     def set_state(self, state: str):
-        if state not in self.PALETTE or state == self._state:
+        palette = self.PET_STYLES[self._pet_kind]["palette"]
+        if state not in palette or state == self._state:
             return
         self._state = state
         if state != "idle":
             self.say(self.TIPS[state][0], 5000)
+        self.update()
+
+    def set_pet_kind(self, pet_kind: str):
+        if pet_kind not in self.PET_STYLES or pet_kind == self._pet_kind:
+            return
+        self._pet_kind = pet_kind
+        self._tip_idx = 0
+        self.say(f"我是{self.PET_STYLES[pet_kind]['label']}，继续陪你护眼")
         self.update()
 
     def set_countdown(self, left_secs: int, total_secs: int):
@@ -957,7 +1017,8 @@ class DesktopPet(QWidget):
 
     # ── 绘制 ──────────────────────────────────
     def paintEvent(self, event):
-        body, light, belly = self.PALETTE[self._state]
+        style = self.PET_STYLES[self._pet_kind]
+        body, light, belly = style["palette"][self._state]
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         bob = math.sin(self._phase) * 3.0 + self._squash * 5
@@ -969,20 +1030,21 @@ class DesktopPet(QWidget):
         p.setBrush(QColor(0, 0, 0, 70))
         p.drawEllipse(int(self.W / 2 - sw / 2), 142, sw, 12)
 
-        # 尾巴（左右摆动）
         wag = math.sin(self._phase * 1.7) * 9
-        p.setBrush(QColor(body))
-        p.drawEllipse(int(106 + wag * 0.5), int(top + 60), 28, 13)
+        if style["tail"] == "puff":
+            p.setBrush(QColor(light))
+            p.drawEllipse(112, int(top + 72), 24, 24)
+        elif style["tail"] == "wing":
+            p.setBrush(QColor(light))
+            p.drawEllipse(104, int(top + 65 + wag * 0.3), 34, 17)
+        else:
+            p.setBrush(QColor(body))
+            p.drawEllipse(int(106 + wag * 0.5), int(top + 60), 28, 13)
 
-        # 耳朵
-        p.setBrush(QColor(light))
-        p.drawEllipse(25, int(top - 4), 30, 34)
-        p.drawEllipse(95, int(top - 4), 30, 34)
-        p.setBrush(QColor(belly))
-        p.drawEllipse(33, int(top + 5), 13, 17)
-        p.drawEllipse(103, int(top + 5), 13, 17)
+        self._paint_ears(p, top, light, belly, style["ears"])
 
         # 身体 + 肚皮 + 脚
+        p.setPen(Qt.NoPen)
         p.setBrush(QColor(body))
         p.drawRoundedRect(QRect(28, int(top + 8), 94, 90), 34, 34)
         p.setBrush(QColor(belly))
@@ -992,8 +1054,77 @@ class DesktopPet(QWidget):
         p.drawEllipse(84, int(top + 84), 28, 15)
 
         self._paint_face(p, top)
+        self._paint_accessory(p, top, style["accessory"])
         self._paint_bar(p)
         self._paint_bubble(p)
+
+    def _paint_ears(self, p, top, light, belly, ear_style):
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(light))
+        if ear_style == "pointed":
+            for x, angle in ((42, -18), (108, 18)):
+                p.save()
+                p.translate(x, top)
+                p.rotate(angle)
+                p.drawEllipse(-15, -20, 30, 38)
+                p.restore()
+        elif ear_style == "tall":
+            p.drawEllipse(34, int(top - 18), 24, 52)
+            p.drawEllipse(92, int(top - 18), 24, 52)
+        elif ear_style == "round":
+            p.drawEllipse(27, int(top - 5), 32, 30)
+            p.drawEllipse(91, int(top - 5), 32, 30)
+        else:
+            p.drawEllipse(25, int(top - 4), 30, 34)
+            p.drawEllipse(95, int(top - 4), 30, 34)
+        p.setBrush(QColor(belly))
+        if ear_style == "pointed":
+            for x, angle in ((42, -18), (108, 18)):
+                p.save()
+                p.translate(x, top)
+                p.rotate(angle)
+                p.drawEllipse(-6, -7, 12, 18)
+                p.restore()
+        elif ear_style == "tall":
+            p.drawEllipse(41, int(top + 1), 10, 25)
+            p.drawEllipse(99, int(top + 1), 10, 25)
+        elif ear_style == "round":
+            p.drawEllipse(36, int(top + 3), 14, 14)
+            p.drawEllipse(100, int(top + 3), 14, 14)
+        else:
+            p.drawEllipse(33, int(top + 5), 13, 17)
+            p.drawEllipse(103, int(top + 5), 13, 17)
+
+    def _paint_accessory(self, p, top, accessory):
+        p.setPen(Qt.NoPen)
+        if accessory == "bell":
+            p.setBrush(QColor("#facc15"))
+            p.drawEllipse(69, int(top + 74), 13, 13)
+            p.setBrush(QColor("#78350f"))
+            p.drawEllipse(74, int(top + 82), 3, 3)
+        elif accessory == "bow":
+            p.setBrush(QColor("#f43f5e"))
+            p.drawEllipse(31, int(top + 88), 15, 10)
+            p.drawEllipse(48, int(top + 88), 15, 10)
+            p.drawEllipse(45, int(top + 90), 7, 7)
+        elif accessory == "glasses":
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor("#1f2937"), 3))
+            p.drawEllipse(46, int(top + 32), 21, 19)
+            p.drawEllipse(84, int(top + 32), 21, 19)
+            p.drawLine(67, int(top + 41), 84, int(top + 41))
+        elif accessory == "leaf":
+            p.setBrush(QColor("#22c55e"))
+            p.drawEllipse(70, int(top - 10), 12, 7)
+            p.setPen(QPen(QColor("#15803d"), 2))
+            p.drawLine(76, int(top - 10), 76, int(top - 3))
+        elif accessory == "star":
+            font = QFont("Segoe UI Symbol")
+            font.setPixelSize(15)
+            font.setBold(True)
+            p.setFont(font)
+            p.setPen(QColor("#fde047"))
+            p.drawText(108, int(top + 1), "★")
 
     def _paint_face(self, p, top):
         ink = QColor("#0f172a")
@@ -1106,6 +1237,8 @@ class DesktopPet(QWidget):
                            "QMenu::item{padding:5px 24px 5px 14px;}"
                            "QMenu::item:selected{background:#21262d;}")
         acts = {}
+        pet_kind_actions = {}
+        style_menu = menu.addMenu("切换宠物")
         for label, cb in [("打开主界面", self._open_app),
                           ("立即休息一下", self._rest_now),
                           ("切换护眼", self._toggle_care),
@@ -1117,9 +1250,18 @@ class DesktopPet(QWidget):
             act = menu.addAction(label)
             act.setEnabled(cb is not None)
             acts[act] = cb
-        cb = acts.get(menu.exec_(pos))
-        if cb:
-            cb()
+        for pet_kind, info in self.PET_STYLES.items():
+            act = style_menu.addAction(info["label"])
+            act.setCheckable(True)
+            act.setChecked(pet_kind == self._pet_kind)
+            pet_kind_actions[act] = pet_kind
+        chosen = menu.exec_(pos)
+        if chosen in pet_kind_actions:
+            self.set_pet_kind(pet_kind_actions[chosen])
+        else:
+            cb = acts.get(chosen)
+            if cb:
+                cb()
 
 
 class CareEyesApp(QWidget):
@@ -1148,6 +1290,7 @@ class CareEyesApp(QWidget):
         self.force_rest = False          # #9 强制休息
         self.autostart = False; self.sound_enabled = True
         self.pet_enabled = True
+        self.pet_kind = DesktopPet.DEFAULT_PET_KIND
         self.pet_pos = None
         self.today_minutes = 0; self.break_count = 0
         self.week_data = {}
@@ -1233,6 +1376,7 @@ class CareEyesApp(QWidget):
             rest_now=self.show_rest_overlay,
             toggle_care=self._hk_toggle,
             on_moved=self._on_pet_moved,
+            pet_kind=self.pet_kind,
         )
         self.pet.setVisible(False)
         self.pet.set_countdown(self._next_rest_secs, self.rest_interval_min * 60)
@@ -1252,6 +1396,23 @@ class CareEyesApp(QWidget):
     def _hide_pet(self):
         if self.pet is not None:
             self.pet.hide()
+
+    def _set_pet_kind(self, pet_kind):
+        if pet_kind not in DesktopPet.PET_STYLES or pet_kind == self.pet_kind:
+            return
+        self.pet_kind = pet_kind
+        if self.pet is not None:
+            self.pet.set_pet_kind(pet_kind)
+        if hasattr(self, "pet_style_combo"):
+            index = self.pet_style_combo.findData(pet_kind)
+            if index >= 0:
+                self.pet_style_combo.blockSignals(True)
+                self.pet_style_combo.setCurrentIndex(index)
+                self.pet_style_combo.blockSignals(False)
+        self._schedule_save()
+
+    def _on_pet_kind_selected(self, index):
+        self._set_pet_kind(self.pet_style_combo.itemData(index))
 
     def _open_main(self):
         self.show()
@@ -1688,6 +1849,19 @@ class CareEyesApp(QWidget):
         self.sound_cb.stateChanged.connect(self._on_sound_toggle)
         self.pet_cb.stateChanged.connect(self._on_pet_toggle)
         self.force_rest_cb.stateChanged.connect(self._on_force_rest_toggle)
+
+        pet_style_row = QHBoxLayout()
+        pet_style_row.addWidget(QLabel("宠物形象"))
+        self.pet_style_combo = QComboBox()
+        for pet_kind, info in DesktopPet.PET_STYLES.items():
+            self.pet_style_combo.addItem(info["label"], pet_kind)
+        self.pet_style_combo.setCurrentIndex(
+            self.pet_style_combo.findData(self.pet_kind))
+        self.pet_style_combo.currentIndexChanged.connect(self._on_pet_kind_selected)
+        pet_style_row.addStretch()
+        pet_style_row.addWidget(self.pet_style_combo)
+        cl.addLayout(pet_style_row)
+        cl.addWidget(self._div())
 
         hk = QLabel("全局快捷键\n"
                     "Ctrl+Alt+↑/↓  亮度 ±5%\n"
@@ -2216,7 +2390,7 @@ class CareEyesApp(QWidget):
         widgets = [self.temp_slider, self.bright_slider, self.interval_spin,
                    self.duration_spin, self.auto_toggle, self.dim_toggle,
                    self.dim_slider, self.force_rest_cb, self.sound_cb,
-                   self.pet_cb, self.autostart_cb]
+                   self.pet_cb, self.autostart_cb, self.pet_style_combo]
         for widget in widgets:
             widget.blockSignals(True)
         try:
@@ -2230,6 +2404,7 @@ class CareEyesApp(QWidget):
             self.force_rest = False
             self.sound_enabled = True
             self.pet_enabled = True
+            self.pet_kind = DesktopPet.DEFAULT_PET_KIND
             self.autostart = False
             self.temp_slider.setValue(5000)
             self.bright_slider.setValue(100)
@@ -2242,6 +2417,8 @@ class CareEyesApp(QWidget):
             self.force_rest_cb.setChecked(False)
             self.sound_cb.setChecked(True)
             self.pet_cb.setChecked(True)
+            self.pet_style_combo.setCurrentIndex(
+                self.pet_style_combo.findData(self.pet_kind))
             self.autostart_cb.setChecked(False)
         finally:
             for widget in widgets:
@@ -2262,6 +2439,8 @@ class CareEyesApp(QWidget):
         self.week_data = {}
         self._work_clock.restart(self.rest_interval_min * 60, reset_session=True)
         self.pet_pos = None                 # 桌宠回到右下角默认位置
+        if self.pet is not None:
+            self.pet.set_pet_kind(self.pet_kind)
         self._hide_pet()
         self._show_pet()
         if self.pet is not None:
@@ -2301,7 +2480,7 @@ class CareEyesApp(QWidget):
         "sound_enabled":True,"stat_date":"","today_minutes":0,"break_count":0,
         "today_seconds":-1.0,
         "week_data":{},
-        "pet_enabled":True,"pet_pos":[],
+        "pet_enabled":True,"pet_kind":"blue_cat","pet_pos":[],
     }
 
     def load_settings(self):
@@ -2328,6 +2507,8 @@ class CareEyesApp(QWidget):
         self.super_dim_alpha=_bounded_int(cfg["super_dim_alpha"], 80, 20, 200)
         self.sound_enabled=cfg["sound_enabled"]
         self.pet_enabled=cfg["pet_enabled"]
+        self.pet_kind = (cfg["pet_kind"] if cfg["pet_kind"] in DesktopPet.PET_STYLES
+                         else DesktopPet.DEFAULT_PET_KIND)
         self.pet_pos=_parse_position(cfg["pet_pos"])
         cutoff = date.today() - timedelta(days=31)
         week_data = cfg["week_data"] if isinstance(cfg["week_data"], dict) else {}
@@ -2385,7 +2566,9 @@ class CareEyesApp(QWidget):
             "stat_date":today,"today_minutes":self.today_minutes,
             "today_seconds":self._today_seconds,
             "break_count":self.break_count,"week_data":self.week_data,
-            "pet_enabled":self.pet_enabled,"pet_pos":self.pet_pos or [],
+            "pet_enabled":self.pet_enabled,
+            "pet_kind":vars(self).get("pet_kind", DesktopPet.DEFAULT_PET_KIND),
+            "pet_pos":self.pet_pos or [],
         }
         tmp = CONFIG_FILE + ".tmp"
         try:

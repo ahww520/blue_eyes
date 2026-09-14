@@ -23,7 +23,12 @@ class OffscreenUiTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         config_path = os.path.join(self.directory.name, "settings.json")
         config = dict(mainpro.CareEyesApp._DEFAULTS)
-        config.update({"pet_enabled": False, "sound_enabled": False})
+        config.update({
+            "pet_enabled": False,
+            "sound_enabled": False,
+            "pet_kind": "mint_bunny",
+        })
+        self.config_path = config_path
         with open(config_path, "w", encoding="utf-8") as handle:
             json.dump(config, handle)
 
@@ -93,6 +98,30 @@ class OffscreenUiTests(unittest.TestCase):
         self.assertEqual(self.window.today_minutes, 0)
         self.assertEqual(self.window._next_rest_secs, 45 * 60)
         self.assertTrue(self.window.is_enabled)
+
+    def test_pet_styles_change_and_persist(self):
+        self.assertEqual(self.window.pet_kind, "mint_bunny")
+        self.assertEqual(self.window.pet._pet_kind, "mint_bunny")
+        self.assertEqual(self.window.pet_style_combo.currentData(), "mint_bunny")
+
+        self.window._set_pet_kind("orange_fox")
+        self.assertEqual(self.window.pet._pet_kind, "orange_fox")
+        self.assertEqual(self.window.pet_style_combo.currentData(), "orange_fox")
+        self.window._save_settings()
+
+        with open(self.config_path, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual(saved["pet_kind"], "orange_fox")
+
+        for pet_kind in mainpro.DesktopPet.PET_STYLES:
+            pet = mainpro.DesktopPet(pet_kind=pet_kind)
+            pet.show()
+            self.assertFalse(pet.grab().isNull())
+            pet._anim_timer.stop()
+            pet._chat_timer.stop()
+            pet._msg_timer.stop()
+            pet.deleteLater()
+        self.application.processEvents()
 
 
 if __name__ == "__main__":
