@@ -1,23 +1,3 @@
-"""
-CareEyes Pro v5.2
-轻量护眼工具 - 紧凑界面版
-
-依赖安装:
-    pip install PyQt5 pynput
-
-桌面宠物（新增）:
-  - 纯 QPainter 绘制，无额外依赖；跟随护眼状态变表情
-  - 脚下细进度条显示距离下次休息的进度
-  - 戳一戳有反应、拖动贴边、位置记忆
-  - 右键菜单：打开主界面 / 立即休息 / 切换护眼 / 藏起来 / 退出
-  - 托盘和设置页均有开关，状态写入配置文件
-
-v5.2 新增/修复:
-  - 顶部紧凑导航替代宽侧边栏，减少界面占用
-  - 预设按钮和页面间距收紧，信息密度更高
-  - 去除未使用的 pywin32 依赖
-  - 增加精简 PyInstaller 构建配置和 Windows 版本信息
-"""
 
 import sys
 import ctypes
@@ -25,6 +5,7 @@ import ctypes.wintypes
 import math
 import json
 import os
+import random
 import shutil
 import time
 try:
@@ -40,11 +21,11 @@ from PyQt5.QtWidgets import (
     QSizePolicy, QGridLayout, QProgressBar, QMessageBox
 )
 from PyQt5.QtCore import (
-    Qt, QTimer, QRect, pyqtSignal, QObject
+    Qt, QTimer, QPointF, QRect, QRectF, pyqtSignal, QObject
 )
 from PyQt5.QtGui import (
-    QColor, QCursor, QFont, QFontMetrics, QIcon, QPainter, QPainterPath,
-    QPen, QPixmap
+    QColor, QCursor, QFont, QFontMetrics, QGradient, QIcon, QLinearGradient,
+    QPainter, QPainterPath, QPen, QPixmap, QRadialGradient, QTransform
 )
 from careeyes_runtime import (
     GammaController, SingleInstance, WindowsActivityMonitor,
@@ -811,67 +792,160 @@ class DesktopPet(QWidget):
     """
     W, H = 150, 168
     BODY_TOP = 36
+    ART_TOP = {
+        "blue_cat": -9, "orange_fox": -12, "mint_bunny": -31,
+        "purple_owl": -4, "pink_poodle": 2, "charcoal_cat": -9,
+        "seagull": -7, "cream_cat": -13, "pixel_robot": -22,
+    }
 
     DEFAULT_PET_KIND = "blue_cat"
+    # 首屏只展示概念图中的三款主角；旧皮肤仍保留在“更多外观”中，
+    # 这样升级不会让已有配置失效，也不会让相似的圆形角色挤在一起。
+    FEATURED_PETS = ("seagull", "cream_cat", "pixel_robot")
+    DEFAULT_DECORATION = "scarf"
+
+    # 参考 momo-soft-play 的四种软体玩法；额外保留轻戳模式，方便
+    # 想维持旧版“点一下就说话”行为的用户。模式只影响桌宠本身，
+    # 不改变窗口拖动、护眼计时或托盘逻辑。
+    # 默认不强加互动手势，保持传统桌宠的左键拖动体验。
+    DEFAULT_INTERACTION_MODE = "move"
+    INTERACTION_MODES = {
+        "move": {
+            "label": "自由移动", "hint": "左键按住拖动，调整桌宠位置",
+            "color": "#7dd3fc",
+        },
+        "squish": {
+            "label": "捏一捏",
+            "hint": "按住桌宠，它会软软回弹",
+            "color": "#60d8ce",
+        },
+        "stretch": {
+            "label": "拉长长",
+            "hint": "拖动桌宠，感受弹性拉伸",
+            "color": "#8ec5ff",
+        },
+        "tickle": {
+            "label": "挠痒痒",
+            "hint": "左右轻拖，看看它笑出小星星",
+            "color": "#f6c86f",
+        },
+        "toss": {
+            "label": "抛一下",
+            "hint": "拖动后松手，让它弹一下",
+            "color": "#c4a7ff",
+        },
+        "poke": {
+            "label": "轻戳",
+            "hint": "点击一下，触发一个小反应",
+            "color": "#f39ab4",
+        },
+    }
+
+    INTERACTION_PHRASES = {
+        "squish": (
+            "嘿，被你捏成一小团了",
+            "慢慢捏，我会自己弹回来",
+            "压力交给我，快乐还给你",
+        ),
+        "stretch": (
+            "再长一点点也没关系",
+            "拉——长——一小团快乐",
+            "我的弹性还在线呢",
+        ),
+        "tickle": (
+            "哈哈哈，那里真的很痒",
+            "停一下，我要笑出星星了",
+            "你挠得我尾巴都在抖",
+        ),
+        "toss": (
+            "接住我，我要起飞啦",
+            "轻轻一抛，快乐就起飞",
+            "落地也要软乎乎的",
+        ),
+        "poke": (
+            "被你戳到啦",
+            "我在这儿，收到你的信号",
+            "轻一点，我会害羞的",
+        ),
+    }
+
+    DECORATIONS = {
+        "scarf": {
+            "label": "薄荷围巾", "symbol": "⌁", "color": "#60d8ce",
+            "unlocked": True,
+        },
+        "sprout": {
+            "label": "头顶小芽", "symbol": "❧", "color": "#9bd7a6",
+            "unlocked": True,
+        },
+        "star_pin": {
+            "label": "星星别针", "symbol": "★", "color": "#e6c878",
+            "unlocked": False,
+        },
+        "night_cap": {
+            "label": "晚安帽", "symbol": "☾", "color": "#a8b2d8",
+            "unlocked": False,
+        },
+    }
 
     @staticmethod
     def _make_palette(primary, highlight, belly):
         base = QColor(primary)
         return {
             "idle": (primary, highlight, belly),
-            "tired": (base.darker(112).name(), highlight, belly),
-            "resting": (base.darker(126).name(), base.lighter(145).name(), belly),
-            "off": ("#475569", "#64748b", "#e2e8f0"),
+            "tired": (base.darker(105).name(), highlight, belly),
+            "resting": (base.darker(112).name(), highlight, belly),
+            "off": ("#7b8994", "#a2aeb6", "#dfe6ea"),
         }
 
     PET_STYLES = {
         "blue_cat": {
             "label": "蓝猫",
             "tagline": "元气在线，提醒你别盯太久。",
-            "palette": _make_palette("#0ea5e9", "#38bdf8", "#e0f2fe"),
+            "palette": _make_palette("#8cbdd9", "#bcdcec", "#eff7fb"),
             "ears": "cat",
             "tail": "cat",
-            "accessory": "bell",
+            "renderer": "blue_cat",
         },
         "orange_fox": {
             "label": "橘狐",
             "tagline": "机灵守时，到点就催你歇会儿。",
-            "palette": _make_palette("#f97316", "#fdba74", "#fff7ed"),
+            "palette": _make_palette("#e6a16b", "#f2c79e", "#fff2df"),
             "ears": "pointed",
             "tail": "cat",
-            "accessory": "leaf",
+            "renderer": "orange_fox",
         },
         "mint_bunny": {
             "label": "薄荷兔",
             "tagline": "清清爽爽，陪你把节奏慢下来。",
-            "palette": _make_palette("#10b981", "#6ee7b7", "#ecfdf5"),
+            "palette": _make_palette("#9bcfbd", "#c5e8d8", "#f1faf3"),
             "ears": "tall",
             "tail": "puff",
-            "accessory": "bow",
+            "renderer": "mint_bunny",
         },
         "purple_owl": {
             "label": "紫鸮",
             "tagline": "夜里也盯着你，别拿熬夜当本事。",
-            "palette": _make_palette("#8b5cf6", "#c4b5fd", "#f5f3ff"),
+            "palette": _make_palette("#b1a0d2", "#d8cbed", "#f7f1fb"),
             "ears": "round",
             "tail": "wing",
-            "accessory": "glasses",
+            "renderer": "purple_owl",
         },
         "pink_poodle": {
             "label": "粉贵宾",
             "tagline": "软乎归软乎，休息时间一点不让。",
-            "palette": _make_palette("#ec4899", "#f9a8d4", "#fdf2f8"),
+            "palette": _make_palette("#dba9bd", "#edcfdd", "#fff3f5"),
             "ears": "round",
             "tail": "puff",
-            "accessory": "bow",
+            "renderer": "pink_poodle",
         },
         "charcoal_cat": {
             "label": "夜行猫",
             "tagline": "安静待命，护眼关闭也会提醒你。",
-            "palette": _make_palette("#334155", "#64748b", "#f1f5f9"),
+            "palette": _make_palette("#526477", "#8396ab", "#dce6ef"),
             "ears": "cat",
             "tail": "cat",
-            "accessory": "star",
+            "renderer": "charcoal_cat",
         },
         "seagull": {
             "label": "小海鸥",
@@ -880,15 +954,15 @@ class DesktopPet(QWidget):
             "palette": {
                 "idle": ("#f1f6f9", "#d4e2ec", "#ffffff"),
                 "tired": ("#e5edf2", "#c5d5e1", "#f8fafc"),
-                "resting": ("#cad8e3", "#e1eaf1", "#f1f5f9"),
-                "off": ("#64748b", "#94a3b8", "#e2e8f0"),
+                "resting": ("#d9e4eb", "#c5d5df", "#f1f5f9"),
+                "off": ("#85939e", "#a5b3bd", "#dfe6ea"),
             },
         },
         "cream_cat": {
             "label": "奶油猫",
             "tagline": "暖乎乎陪着你，忙完记得眨眨眼。",
             "renderer": "cream_cat",
-            "palette": _make_palette("#efc18d", "#d99f68", "#fff0d9"),
+            "palette": _make_palette("#edc9a0", "#ca996d", "#fff3e1"),
         },
         "pixel_robot": {
             "label": "像素机器人",
@@ -913,7 +987,9 @@ class DesktopPet(QWidget):
 
     def __init__(self, open_app=None, hide_pet=None, quit_app=None,
                  rest_now=None, toggle_care=None, on_moved=None,
-                 pet_kind=DEFAULT_PET_KIND):
+                 pet_kind=DEFAULT_PET_KIND, decoration=DEFAULT_DECORATION,
+                 interaction_mode=DEFAULT_INTERACTION_MODE,
+                 on_interaction_mode_changed=None):
         super().__init__(None)
         self._open_app    = open_app
         self._hide_pet    = hide_pet
@@ -921,7 +997,12 @@ class DesktopPet(QWidget):
         self._rest_now    = rest_now
         self._toggle_care = toggle_care
         self._on_moved    = on_moved
+        self._on_interaction_mode_changed = on_interaction_mode_changed
         self._pet_kind = pet_kind if pet_kind in self.PET_STYLES else self.DEFAULT_PET_KIND
+        self._decoration = (decoration if decoration in self.DECORATIONS
+                            and self.DECORATIONS[decoration]["unlocked"]
+                            else self.DEFAULT_DECORATION)
+        self._interaction_mode = self.normalize_interaction_mode(interaction_mode)
 
         self._state = "idle"
         self._phase = 0.0
@@ -935,6 +1016,7 @@ class DesktopPet(QWidget):
         self._left_secs = 0
         self._total_secs = 0
         self._look = (0.0, 0.0)     # 眼球偏移
+        self._init_interaction_state()
 
         self.setFixedSize(self.W, self.H)
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint |
@@ -943,7 +1025,7 @@ class DesktopPet(QWidget):
         self.setAttribute(Qt.WA_NoSystemBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setCursor(Qt.PointingHandCursor)
-        self.setToolTip("左键戳一下 · 拖动移动 · 右键菜单")
+        self._update_tooltip()
 
         self._anim_timer = QTimer(self)
         self._anim_timer.timeout.connect(self._tick)
@@ -954,6 +1036,464 @@ class DesktopPet(QWidget):
         self._chat_timer = QTimer(self)          # 偶尔自己冒个泡
         self._chat_timer.timeout.connect(self._auto_chat)
         self._chat_timer.start(120_000)
+
+    @classmethod
+    def normalize_interaction_mode(cls, mode):
+        """返回可用互动模式，旧配置或脏数据统一回落到默认值。"""
+        return mode if mode in cls.INTERACTION_MODES else cls.DEFAULT_INTERACTION_MODE
+
+    @staticmethod
+    def _neutral_interaction_values():
+        return {
+            "x": 0.0,
+            "y": 0.0,
+            "scale_x": 1.0,
+            "scale_y": 1.0,
+            "rotation": 0.0,
+            "bend": 0.0,
+            "press": 0.0,
+            "wobble": 0.0,
+        }
+
+    def _init_interaction_state(self):
+        """初始化与窗口位置无关的软体动画状态，预览组件也可复用。"""
+        self._interaction_current = self._neutral_interaction_values()
+        self._interaction_target = self._neutral_interaction_values()
+        self._interaction_velocity = {
+            key: 0.0 for key in self._interaction_current
+        }
+        self._interaction_active = False
+        self._interaction_announced = False
+        self._interaction_start = (self.W / 2, self.BODY_TOP + 48)
+        self._interaction_global_start = self._interaction_start
+        self._interaction_last_global = self._interaction_start
+        self._interaction_pointer = self._interaction_start
+        self._interaction_last_time = time.monotonic()
+        self._pointer_velocity = (0.0, 0.0)
+        self._last_particle_at = 0.0
+        self._toss_active = False
+        self._toss_velocity = [0.0, 0.0]
+        self._toss_elapsed = 0.0
+        self._last_bounce_at = 0.0
+        self._particles = []
+        self._ripples = []
+        self._hovering = False
+        self._interaction_count = 0
+        self._surprise_kind = None
+        self._surprise_elapsed = 0.0
+        self._surprise_duration = 0.0
+        self._surprise_index = 0
+        self._surprise_burst_done = False
+        self._window_dragging = False
+
+    @property
+    def interaction_mode(self):
+        return self._interaction_mode
+
+    @interaction_mode.setter
+    def interaction_mode(self, mode):
+        self.set_interaction_mode(mode)
+
+    def _update_tooltip(self):
+        info = self.INTERACTION_MODES[self._interaction_mode]
+        countdown = ""
+        if getattr(self, "_total_secs", 0):
+            minutes, seconds = divmod(max(0, self._left_secs), 60)
+            countdown = f"距离下次休息 {minutes:02d}:{seconds:02d}\n"
+        self.setToolTip(
+            f"{countdown}玩法：{info['label']} · "
+            f"{'左键拖动移动' if self._interaction_mode == 'move' else '左键玩耍 · Shift+拖动移动'} · "
+            "双击惊喜 · Ctrl+双击主界面 · 右键菜单"
+        )
+
+    def set_interaction_mode(self, mode):
+        """切换玩法并让当前形变平滑回到中性状态。"""
+        mode = self.normalize_interaction_mode(mode)
+        if mode == self._interaction_mode:
+            self._update_tooltip()
+            return False
+        self.cancel_interaction()
+        self._interaction_mode = mode
+        self._update_tooltip()
+        self._spawn_particles("spark", 5)
+        if hasattr(self, "_msg_timer"):
+            self.say(f"切到{self.INTERACTION_MODES[mode]['label']}模式啦", 2200)
+        callback = getattr(self, "_on_interaction_mode_changed", None)
+        if callback is not None:
+            callback(mode)
+        self.update()
+        return True
+
+    def _set_interaction_target(self, **values):
+        for key, value in values.items():
+            if key in self._interaction_target:
+                self._interaction_target[key] = float(value)
+
+    def _neutral_interaction(self):
+        self._interaction_target.update(self._neutral_interaction_values())
+
+    def cancel_interaction(self, immediate=False):
+        """终止抓取、抛掷或惊喜动画；用于模式切换和失焦恢复。"""
+        self._interaction_active = False
+        self._interaction_announced = False
+        self._toss_active = False
+        self._toss_velocity[:] = (0.0, 0.0)
+        self._surprise_kind = None
+        self._neutral_interaction()
+        if immediate:
+            self._interaction_current.update(self._neutral_interaction_values())
+            for key in self._interaction_velocity:
+                self._interaction_velocity[key] = 0.0
+        self.update()
+
+    def _interaction_phrase(self):
+        phrases = self.INTERACTION_PHRASES[self._interaction_mode]
+        index = self._interaction_count % len(phrases)
+        self._interaction_count += 1
+        return phrases[index]
+
+    def _announce_interaction(self):
+        if self._interaction_announced:
+            return
+        self._interaction_announced = True
+        if hasattr(self, "_msg_timer"):
+            self.say(self._interaction_phrase(), 2800)
+
+    def _begin_interaction(self, local_x, local_y, global_x=None, global_y=None):
+        now = time.monotonic()
+        gx = float(local_x if global_x is None else global_x)
+        gy = float(local_y if global_y is None else global_y)
+        self._interaction_active = True
+        self._interaction_announced = False
+        self._interaction_start = (float(local_x), float(local_y))
+        self._interaction_global_start = (gx, gy)
+        self._interaction_last_global = (gx, gy)
+        self._interaction_pointer = (float(local_x), float(local_y))
+        self._interaction_last_time = now
+        self._pointer_velocity = (0.0, 0.0)
+        self._toss_active = False
+        self._surprise_kind = None
+        self._spawn_ripple(local_x, local_y)
+
+        mode = self._interaction_mode
+        if mode == "squish":
+            self._set_interaction_target(scale_x=1.16, scale_y=.76,
+                                         y=5, press=1.0, wobble=.08)
+        elif mode == "stretch":
+            self._set_interaction_target(scale_x=.98, scale_y=1.08,
+                                         press=.35)
+        elif mode == "tickle":
+            self._set_interaction_target(scale_x=1.03, scale_y=.96,
+                                         press=.22, wobble=.6)
+        elif mode == "toss":
+            self._set_interaction_target(scale_x=.96, scale_y=1.05,
+                                         press=.18)
+        else:
+            self._set_interaction_target(scale_x=1.08, scale_y=.90,
+                                         y=4, press=.55)
+        self._blink = max(self._blink, 2)
+
+    def _update_drag_interaction(self, local_x, local_y, global_x, global_y):
+        if not self._interaction_active:
+            return
+        now = time.monotonic()
+        dt = max(.008, min(.12, now - self._interaction_last_time))
+        gx, gy = float(global_x), float(global_y)
+        last_x, last_y = self._interaction_last_global
+        velocity_x = (gx - last_x) / dt
+        velocity_y = (gy - last_y) / dt
+        # 低通一下，避免低频鼠标事件造成释放速度暴跳。
+        old_vx, old_vy = self._pointer_velocity
+        self._pointer_velocity = (
+            old_vx * .45 + velocity_x * .55,
+            old_vy * .45 + velocity_y * .55,
+        )
+        self._interaction_last_global = (gx, gy)
+        self._interaction_last_time = now
+        self._interaction_pointer = (float(local_x), float(local_y))
+        start_x, start_y = self._interaction_global_start
+        dx, dy = gx - start_x, gy - start_y
+        distance = math.hypot(dx, dy)
+        if distance > 7:
+            self._announce_interaction()
+
+        mode = self._interaction_mode
+        if mode == "stretch":
+            horizontal = min(.45, abs(dx) / 115.0)
+            vertical = min(.42, abs(dy) / 105.0)
+            self._set_interaction_target(
+                x=max(-18, min(18, dx * .16)),
+                y=max(-15, min(16, dy * .14)),
+                scale_x=max(.82, 1 + horizontal - vertical * .20),
+                scale_y=max(.72, 1 + vertical - horizontal * .20),
+                rotation=max(-.22, min(.22, dx * .0022)),
+                bend=max(-18, min(18, dx * .08)),
+                press=.32,
+            )
+        elif mode == "tickle":
+            speed = math.hypot(*self._pointer_velocity)
+            wobble = max(.35, min(2.4, speed / 180.0))
+            self._set_interaction_target(
+                x=max(-10, min(10, dx * .10)),
+                y=max(-7, min(7, dy * .08)),
+                rotation=math.sin(self._phase * 8.0) * .055,
+                scale_x=1.04,
+                scale_y=.95,
+                bend=max(-9, min(9, dx * .04)),
+                press=.22,
+                wobble=wobble,
+            )
+            if speed > 75 and now - self._last_particle_at > .11:
+                self._spawn_particles("star", 2, (local_x, local_y))
+                self._last_particle_at = now
+        elif mode == "toss":
+            speed_y = min(.14, abs(self._pointer_velocity[1]) / 2600.0)
+            self._set_interaction_target(
+                x=max(-34, min(34, dx * .48)),
+                y=max(-27, min(28, dy * .42)),
+                rotation=max(-.32, min(.32, dx * .0035)),
+                scale_x=max(.84, 1.0 - speed_y),
+                scale_y=1.0 + speed_y,
+                bend=max(-12, min(12, dx * .05)),
+                press=.12,
+            )
+        elif mode == "squish":
+            pressure = min(.42, .24 + distance / 260.0)
+            self._set_interaction_target(
+                x=max(-10, min(10, dx * .08)),
+                y=max(2, min(11, 5 + dy * .07)),
+                scale_x=1.0 + pressure * .62,
+                scale_y=max(.58, 1.0 - pressure),
+                rotation=max(-.16, min(.16, dx * .0018)),
+                bend=max(-11, min(11, dx * .055)),
+                press=1.0,
+                wobble=.10,
+            )
+        else:
+            self._set_interaction_target(
+                x=max(-7, min(7, dx * .06)),
+                y=max(-5, min(7, dy * .06)),
+                scale_x=1.08,
+                scale_y=.90,
+                rotation=max(-.10, min(.10, dx * .0015)),
+                press=.55,
+            )
+
+    def _start_toss(self, velocity_x, velocity_y, force=False):
+        if not force and math.hypot(velocity_x, velocity_y) < 85:
+            velocity_x, velocity_y = 0.0, -290.0
+        self._toss_active = True
+        self._toss_elapsed = 0.0
+        self._toss_velocity[:] = (
+            max(-520.0, min(520.0, velocity_x * .48)),
+            max(-640.0, min(430.0, velocity_y * .48)),
+        )
+        if abs(self._toss_velocity[0]) + abs(self._toss_velocity[1]) < 70:
+            self._toss_velocity[1] = -290.0
+        self._set_interaction_target(press=0, scale_x=1, scale_y=1)
+        self._spawn_particles("bubble", 5)
+
+    def _finish_interaction(self, was_dragged=False, cancelled=False):
+        if not self._interaction_active and not self._toss_active:
+            return
+        self._interaction_active = False
+        if cancelled:
+            self._neutral_interaction()
+            return
+        velocity_x, velocity_y = self._pointer_velocity
+        if not was_dragged:
+            self._poke()
+            return
+        self._announce_interaction()
+        if self._interaction_mode == "toss":
+            self._start_toss(velocity_x, velocity_y)
+        else:
+            self._neutral_interaction()
+            # 给弹簧一个反向冲量，让松手不是机械地线性复位。
+            self._interaction_velocity["scale_x"] -= .65
+            self._interaction_velocity["scale_y"] += .75
+            self._interaction_velocity["rotation"] -= velocity_x * .00035
+            effect = "heart" if self._interaction_mode == "squish" else "star"
+            count = 7 if self._interaction_mode == "tickle" else 4
+            self._spawn_particles(effect, count)
+
+    def trigger_surprise(self, kind=None):
+        """触发双击彩蛋；kind 主要用于自动化测试和菜单的确定性调用。"""
+        kinds = ("happy", "sneeze", "sleep")
+        if kind not in kinds:
+            kind = kinds[self._surprise_index % len(kinds)]
+            self._surprise_index += 1
+        self.cancel_interaction()
+        self._surprise_kind = kind
+        self._surprise_elapsed = 0.0
+        self._surprise_duration = {
+            "happy": .95, "sneeze": .90, "sleep": 2.35,
+        }[kind]
+        self._surprise_burst_done = False
+        messages = {
+            "happy": "噔噔，送你一颗小太阳",
+            "sneeze": "阿——嚏！可爱也会打喷嚏",
+            "sleep": "我先融化一会儿，你也歇一下",
+        }
+        if hasattr(self, "_msg_timer"):
+            self.say(messages[kind], 3200 if kind != "sleep" else 4200)
+        if kind == "happy":
+            self._spawn_particles("heart", 13, (self.W / 2, self.BODY_TOP + 42))
+        elif kind == "sleep":
+            self._spawn_particles("bubble", 5, (self.W * .72, self.BODY_TOP + 18))
+        self.update()
+        return kind
+
+    def _tick_surprise(self, dt):
+        if not self._surprise_kind:
+            return
+        self._surprise_elapsed += dt
+        elapsed = self._surprise_elapsed
+        if self._surprise_kind == "happy":
+            jump = -abs(math.sin(min(1.0, elapsed / .78) * math.pi)) * 16
+            self._set_interaction_target(
+                y=jump, scale_x=.94, scale_y=1.09,
+                rotation=math.sin(elapsed * 15) * .045, wobble=.45,
+            )
+        elif self._surprise_kind == "sneeze":
+            if elapsed < .28:
+                self._set_interaction_target(
+                    scale_x=.86, scale_y=1.14, rotation=-.05, y=-2,
+                    press=.25,
+                )
+            elif elapsed < .52:
+                self._set_interaction_target(
+                    scale_x=1.23, scale_y=.76, rotation=.08, y=7,
+                    wobble=1.5, press=.65,
+                )
+                if not self._surprise_burst_done:
+                    self._spawn_particles("star", 11,
+                                          (self.W * .70, self.BODY_TOP + 42))
+                    self._surprise_burst_done = True
+            else:
+                self._neutral_interaction()
+        else:  # sleep
+            self._set_interaction_target(
+                y=8, scale_x=1.18, scale_y=.72, rotation=-.025,
+                press=.22, wobble=0,
+            )
+            self._blink = max(self._blink, 2)
+
+        if elapsed >= self._surprise_duration:
+            self._surprise_kind = None
+            self._neutral_interaction()
+
+    def _tick_interaction(self, dt=.06):
+        self._tick_surprise(dt)
+
+        if self._toss_active:
+            self._toss_elapsed += dt
+            velocity_x, velocity_y = self._toss_velocity
+            velocity_y += 720.0 * dt
+            x = self._interaction_target["x"] + velocity_x * dt
+            y = self._interaction_target["y"] + velocity_y * dt
+            bounced = False
+            if x < -35 or x > 35:
+                x = max(-35, min(35, x))
+                velocity_x *= -.62
+                bounced = True
+            if y < -31:
+                y = -31
+                velocity_y = abs(velocity_y) * .54
+                bounced = True
+            elif y > 28:
+                y = 28
+                velocity_y *= -.56
+                velocity_x *= .72
+                bounced = True
+                self._interaction_velocity["scale_x"] += .85
+                self._interaction_velocity["scale_y"] -= .95
+            self._toss_velocity[:] = (velocity_x, velocity_y)
+            self._set_interaction_target(
+                x=x, y=y,
+                rotation=max(-.34, min(.34, velocity_x * .00055)),
+                scale_x=max(.88, min(1.14, 1 - abs(velocity_y) * .00015)),
+                scale_y=max(.88, min(1.16, 1 + abs(velocity_y) * .00017)),
+            )
+            if bounced and self._toss_elapsed - self._last_bounce_at > .18:
+                self._spawn_ripple(self.W / 2 + x,
+                                   self.BODY_TOP + 92 + min(18, y))
+                self._last_bounce_at = self._toss_elapsed
+            if (self._toss_elapsed > 2.1 or
+                    (self._toss_elapsed > .75 and
+                     abs(velocity_x) + abs(velocity_y) < 95)):
+                self._toss_active = False
+                self._neutral_interaction()
+
+        # 阻尼弹簧：每个形变维度独立回弹，避免突然跳回原形。
+        stiffness = 34.0 if self._interaction_mode == "squish" else 42.0
+        damping = 9.5
+        for key, current in tuple(self._interaction_current.items()):
+            target = self._interaction_target[key]
+            velocity = self._interaction_velocity[key]
+            velocity += ((target - current) * stiffness - velocity * damping) * dt
+            current += velocity * dt
+            if abs(target - current) < .0005 and abs(velocity) < .003:
+                current, velocity = target, 0.0
+            self._interaction_current[key] = current
+            self._interaction_velocity[key] = velocity
+
+        self._interaction_current["scale_x"] = max(
+            .55, min(1.55, self._interaction_current["scale_x"])
+        )
+        self._interaction_current["scale_y"] = max(
+            .55, min(1.55, self._interaction_current["scale_y"])
+        )
+        self._interaction_current["rotation"] = max(
+            -.45, min(.45, self._interaction_current["rotation"])
+        )
+
+        for particle in self._particles:
+            particle["life"] -= dt
+            particle["x"] += particle["vx"] * dt
+            particle["y"] += particle["vy"] * dt
+            particle["vy"] += 34.0 * dt
+            particle["rotation"] += particle["spin"] * dt
+        self._particles = [p for p in self._particles if p["life"] > 0]
+
+        for ripple in self._ripples:
+            ripple["life"] -= dt
+            ripple["radius"] += 24.0 * dt
+        self._ripples = [r for r in self._ripples if r["life"] > 0]
+
+    def _spawn_particles(self, kind="spark", count=5, origin=None):
+        if not hasattr(self, "_particles"):
+            return
+        origin = origin or (self.W / 2, self.BODY_TOP + 45)
+        color = self.INTERACTION_MODES[self._interaction_mode]["color"]
+        for index in range(max(0, int(count))):
+            angle = random.uniform(-math.pi * .88, -math.pi * .12)
+            speed = random.uniform(24.0, 66.0)
+            self._particles.append({
+                "x": float(origin[0]) + random.uniform(-4, 4),
+                "y": float(origin[1]) + random.uniform(-3, 3),
+                "vx": math.cos(angle) * speed,
+                "vy": math.sin(angle) * speed,
+                "life": random.uniform(.62, 1.05),
+                "max_life": 1.05,
+                "size": random.uniform(2.5, 5.0),
+                "kind": kind if kind in ("spark", "star", "heart", "bubble")
+                        else ("star" if index % 2 else "bubble"),
+                "color": color,
+                "rotation": random.uniform(-.5, .5),
+                "spin": random.uniform(-2.2, 2.2),
+            })
+        if len(self._particles) > 54:
+            self._particles = self._particles[-54:]
+
+    def _spawn_ripple(self, x, y):
+        if not hasattr(self, "_ripples"):
+            return
+        self._ripples.append({
+            "x": float(x), "y": float(y), "radius": 4.0,
+            "life": .55, "max_life": .55,
+        })
+        self._ripples = self._ripples[-6:]
 
     # ── 位置 ──────────────────────────────────
     def place(self, pos=None):
@@ -1009,18 +1549,27 @@ class DesktopPet(QWidget):
         self.say(f"我是{self.PET_STYLES[pet_kind]['label']}，继续陪你护眼")
         self.update()
 
+    def set_decoration(self, decoration: str):
+        """切换已解锁的桌宠装饰；锁定装饰只在页面展示，不接受选择。"""
+        if decoration not in self.DECORATIONS:
+            return
+        if not self.DECORATIONS[decoration]["unlocked"]:
+            return
+        if decoration != self._decoration:
+            self._decoration = decoration
+            self.update()
+
     def set_countdown(self, left_secs: int, total_secs: int):
         self._left_secs = max(0, int(left_secs))
         self._total_secs = max(0, int(total_secs))
-        m, s = divmod(self._left_secs, 60)
-        self.setToolTip(f"距离下次休息 {m:02d}:{s:02d}\n"
-                        f"左键戳一下 · 拖动移动 · 右键菜单")
+        self._update_tooltip()
         if self._total_secs:
             self.update()
 
     def say(self, text: str, ms: int = 3200):
         self._msg = text
-        self._msg_timer.start(ms)
+        if hasattr(self, "_msg_timer"):
+            self._msg_timer.start(ms)
         self.update()
 
     def _clear_msg(self):
@@ -1037,6 +1586,7 @@ class DesktopPet(QWidget):
         self._phase += 0.09
         if self._squash > 0:
             self._squash = max(0.0, self._squash - 0.1)
+        self._tick_interaction(.06)
         if self._blink > 0:
             self._blink -= 1
         else:
@@ -1059,15 +1609,51 @@ class DesktopPet(QWidget):
         style = self.PET_STYLES[self._pet_kind]
         body, light, belly = style["palette"][self._state]
         p.setRenderHint(QPainter.Antialiasing)
+        motion = getattr(self, "_interaction_current", None)
+        if motion is None:
+            motion = self._neutral_interaction_values()
         bob = math.sin(self._phase) * 3.0 + self._squash * 5
         top = self.BODY_TOP + bob
         p.setPen(Qt.NoPen)
 
-        # 影子：跳得越高越小
-        sw = 92 - int(bob * 2)
-        p.setBrush(QColor(0, 0, 0, 70))
-        p.drawEllipse(int(self.W / 2 - sw / 2), 142, sw, 12)
+        # 影子与软体位移分开绘制：主体被拉伸或抛起时，脚下仍有落点感。
+        shadow_y = 142 + max(0, int(motion["y"] * .22))
+        sw = max(44, 92 - int(bob * 2) - int(abs(motion["y"]) * .35))
+        shadow = QRadialGradient(.5, .5, .5)
+        shadow.setCoordinateMode(QGradient.ObjectBoundingMode)
+        shadow.setColorAt(0, QColor(5, 16, 25, 92))
+        shadow.setColorAt(.55, QColor(5, 16, 25, 45))
+        shadow.setColorAt(1, QColor(5, 16, 25, 0))
+        p.setBrush(shadow)
+        p.drawEllipse(QRectF(self.W / 2 + motion["x"] * .22 - sw / 2,
+                            shadow_y, sw, max(6, 12 - abs(motion["y"]) * .06)))
 
+        # 角色本体使用同一个局部坐标系，所以九种皮肤都能获得一致的
+        # squish / stretch / wobble 效果，不需要复制每个 renderer 的路径。
+        pivot_x = self.W / 2
+        pivot_y = top + 58
+        wobble_x = math.sin(self._phase * 10.5) * motion["wobble"] * 1.3
+        wobble_y = math.sin(self._phase * 16.0) * motion["wobble"] * .45
+        pose = QTransform()
+        pose.translate(pivot_x + motion["x"] + wobble_x,
+                       pivot_y + motion["y"] + wobble_y + motion["press"] * 1.2)
+        pose.rotate(math.degrees(motion["rotation"] + motion["bend"] * .0015))
+        pose.scale(motion["scale_x"], motion["scale_y"])
+        pose.translate(-pivot_x, -pivot_y)
+        art_top = self.ART_TOP.get(self._pet_kind, -13)
+        if self._decoration == "sprout":
+            art_top = min(art_top, -30)
+        bounds = pose.mapRect(QRectF(20, top + art_top, 123, 113 - art_top))
+        fit = min(1.0, (self.W - 8) / max(1, bounds.width()),
+                  (self.H - 18) / max(1, bounds.height()))
+        half_width, half_height = bounds.width() * fit / 2, bounds.height() * fit / 2
+        center_x = max(4 + half_width, min(self.W - 4 - half_width, bounds.center().x()))
+        center_y = max(4 + half_height, min(self.H - 14 - half_height, bounds.center().y()))
+        p.save()
+        p.translate(center_x - bounds.center().x() * fit,
+                    center_y - bounds.center().y() * fit)
+        p.scale(fit, fit)
+        p.setWorldTransform(pose, True)
         renderer = style.get("renderer", "classic")
         if renderer == "seagull":
             self._paint_seagull(p, top, body, light, belly)
@@ -1075,6 +1661,18 @@ class DesktopPet(QWidget):
             self._paint_cream_cat(p, top, body, light, belly)
         elif renderer == "pixel_robot":
             self._paint_pixel_robot(p, top, body, light, belly)
+        elif renderer == "blue_cat":
+            self._paint_blue_cat(p, top, body, light, belly)
+        elif renderer == "orange_fox":
+            self._paint_orange_fox(p, top, body, light, belly)
+        elif renderer == "mint_bunny":
+            self._paint_mint_bunny(p, top, body, light, belly)
+        elif renderer == "purple_owl":
+            self._paint_purple_owl(p, top, body, light, belly)
+        elif renderer == "pink_poodle":
+            self._paint_pink_poodle(p, top, body, light, belly)
+        elif renderer == "charcoal_cat":
+            self._paint_charcoal_cat(p, top, body, light, belly)
         else:
             wag = math.sin(self._phase * 1.7) * 9
             if style["tail"] == "puff":
@@ -1099,285 +1697,642 @@ class DesktopPet(QWidget):
             p.drawEllipse(84, int(top + 84), 28, 15)
 
             self._paint_face(p, top)
-            self._paint_accessory(p, top, style["accessory"])
+        self._paint_decoration(p, top, self._decoration)
+        p.restore()
+        self._paint_interaction_fx(p)
         if show_bar:
             self._paint_bar(p)
         if show_bubble:
             self._paint_bubble(p)
 
     @staticmethod
-    def _fill_path(p, path, fill, stroke=None, width=1.0):
-        p.setBrush(fill if isinstance(fill, QColor) else QColor(fill))
+    def _fill_path(painter, path, fill, stroke=None, width=1.0):
+        painter.setBrush(QColor(fill) if isinstance(fill, str) else fill)
         if stroke:
             pen = QPen(QColor(stroke), width)
             pen.setCapStyle(Qt.RoundCap)
             pen.setJoinStyle(Qt.RoundJoin)
-            p.setPen(pen)
+            painter.setPen(pen)
         else:
-            p.setPen(Qt.NoPen)
-        p.drawPath(path)
+            painter.setPen(Qt.NoPen)
+        painter.drawPath(path)
 
-    def _paint_rounded_eyes(self, p, centers, eye_y, ink,
-                            eye_width=12, eye_height=18):
-        closed = self._blink > 0 or self._state == "resting"
-        if closed:
-            p.setBrush(Qt.NoBrush)
-            p.setPen(QPen(QColor(ink), 2.5, Qt.SolidLine, Qt.RoundCap))
+    @staticmethod
+    def _pet_ellipse(painter, left, top, width, height, fill, stroke=None):
+        painter.setPen(QPen(QColor(stroke), .85) if stroke else Qt.NoPen)
+        painter.setBrush(QColor(fill) if isinstance(fill, str) else fill)
+        painter.drawEllipse(QRectF(left, top, width, height))
+
+    @staticmethod
+    def _pet_gradient(color, top, height=100):
+        base = QColor(color)
+        gradient = QLinearGradient(42, top, 102, top + height)
+        gradient.setColorAt(0, base.lighter(114))
+        gradient.setColorAt(.48, base)
+        gradient.setColorAt(1, base.darker(112))
+        return gradient
+
+    def _paint_soft_body(self, painter, path, top, color):
+        self._fill_path(painter, path, self._pet_gradient(color, top),
+                        QColor(color).darker(112), .85)
+        painter.save()
+        painter.setClipPath(path)
+        shine = QRadialGradient(53, top + 20, 64)
+        shine.setColorAt(0, QColor(255, 255, 255, 76))
+        shine.setColorAt(1, QColor(255, 255, 255, 0))
+        self._pet_ellipse(painter, -11, top - 44, 128, 128, shine)
+        painter.restore()
+
+    def _paint_paws(self, painter, top, color, centers=(53, 97), width=25):
+        for center_x in centers:
+            self._pet_ellipse(painter, center_x - width / 2, top + 93,
+                              width, 13, self._pet_gradient(color, top + 91, 17),
+                              QColor(color).darker(110))
+            painter.setPen(QPen(QColor(color).darker(119), .8, Qt.SolidLine, Qt.RoundCap))
+            for offset in (-2, 2):
+                painter.drawLine(QPointF(center_x + offset, top + 101),
+                                 QPointF(center_x + offset, top + 104))
+
+    def _paint_cheeks(self, painter, cheek_y, centers=(46, 104)):
+        blush = QRadialGradient(.5, .5, .5)
+        blush.setCoordinateMode(QGradient.ObjectBoundingMode)
+        blush.setColorAt(0, QColor(237, 151, 165, 150 if self._state != "off" else 60))
+        blush.setColorAt(1, QColor(237, 151, 165, 0))
+        for center_x in centers:
+            self._pet_ellipse(painter, center_x - 8, cheek_y, 16, 9, blush)
+
+    def _pet_expression(self):
+        surprise = getattr(self, "_surprise_kind", None)
+        if self._state == "resting" or surprise == "sleep":
+            return "sleep"
+        if self._state == "off":
+            return "off"
+        if surprise == "happy" or (self._interaction_active and self._interaction_mode == "tickle"):
+            return "happy"
+        if self._blink > 0 or surprise == "sneeze":
+            return "blink"
+        return self._state
+
+    def _paint_rounded_eyes(self, painter, centers, eye_y, ink,
+                            eye_width=11, eye_height=16):
+        expression = self._pet_expression()
+        if expression in ("sleep", "blink", "happy"):
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(ink), 2.0, Qt.SolidLine, Qt.RoundCap))
+            bend = -5 if expression == "happy" else 3.5 if expression == "sleep" else 1.0
             for center_x in centers:
-                p.drawArc(int(center_x - eye_width / 2), int(eye_y + 5),
-                          eye_width, 10, 0, -180 * 16)
+                eyelid = QPainterPath(QPointF(center_x - eye_width / 2, eye_y + eye_height * .55))
+                eyelid.quadTo(center_x, eye_y + eye_height * .55 + bend,
+                              center_x + eye_width / 2, eye_y + eye_height * .55)
+                painter.drawPath(eyelid)
             return
-
         look_x, look_y = self._look
-        current_height = 11 if self._state == "tired" else eye_height
+        current_height = eye_height * .55 if expression == "tired" else eye_height
         current_y = eye_y + (eye_height - current_height) / 2
         for center_x in centers:
             left = center_x - eye_width / 2 + look_x
-            p.setPen(Qt.NoPen)
-            p.setBrush(QColor(ink))
-            p.drawEllipse(int(left), int(current_y + look_y),
-                          eye_width, current_height)
-            p.setBrush(QColor(255, 255, 255, 235))
-            p.drawEllipse(int(left + 3), int(current_y + 3 + look_y), 4, 5)
-        if self._state == "tired":
-            p.setBrush(Qt.NoBrush)
-            p.setPen(QPen(QColor(ink), 2.5, Qt.SolidLine, Qt.RoundCap))
+            self._pet_ellipse(painter, left, current_y + look_y, eye_width, current_height,
+                              self._pet_gradient(ink, current_y, current_height))
+            self._pet_ellipse(painter, left + 2, current_y + 2 + look_y,
+                              3.2, 3.8, QColor(255, 255, 255, 235 if expression != "off" else 145))
+            if expression != "tired":
+                self._pet_ellipse(painter, left + eye_width - 4, current_y + current_height - 5 + look_y,
+                                  1.7, 2.1, QColor(225, 242, 253, 155))
+        if expression == "tired":
+            painter.setPen(QPen(QColor(ink), 1.6, Qt.SolidLine, Qt.RoundCap))
             for center_x in centers:
-                p.drawLine(int(center_x - eye_width / 2), int(eye_y + 2),
-                           int(center_x + eye_width / 2), int(eye_y + 1))
+                painter.drawLine(QPointF(center_x - eye_width / 2, current_y + look_y),
+                                 QPointF(center_x + eye_width / 2, current_y + look_y - .5))
 
-    def _paint_sleep_marks(self, p, x, y, color="#c7d2fe"):
-        if self._state != "resting":
-            return
-        font = QFont("Segoe UI")
-        font.setPixelSize(13)
-        font.setBold(True)
-        p.setFont(font)
-        p.setPen(QColor(color))
-        p.drawText(int(x), int(y + math.sin(self._phase) * 2), "z")
-        p.drawText(int(x + 10), int(y - 12 + math.sin(self._phase + 1.2) * 2), "z")
-
-    def _paint_mint_scarf(self, p, center_x, y, width=66):
-        half = width / 2
-        tail = QPainterPath()
-        tail.moveTo(center_x - 13, y + 4)
-        tail.cubicTo(center_x - 14, y + 15, center_x - 10, y + 25,
-                     center_x - 6, y + 32)
-        tail.quadTo(center_x + 2, y + 34, center_x + 8, y + 28)
-        tail.lineTo(center_x + 1, y + 5)
-        tail.closeSubpath()
-        self._fill_path(p, tail, "#3abdb5")
-
-        wrap = QPainterPath()
-        wrap.moveTo(center_x - half, y - 6)
-        wrap.cubicTo(center_x - 13, y + 2, center_x + 14, y + 3,
-                     center_x + half, y - 6)
-        wrap.lineTo(center_x + half - 3, y + 5)
-        wrap.cubicTo(center_x + 12, y + 13, center_x - 14, y + 12,
-                     center_x - half + 3, y + 4)
-        wrap.closeSubpath()
-        self._fill_path(p, wrap, "#72ddd0")
-        p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(QColor("#b7f0e5"), 1.5, Qt.SolidLine, Qt.RoundCap))
-        p.drawArc(int(center_x - half + 8), int(y - 3),
-                  int(width - 16), 13, 195 * 16, 150 * 16)
-
-    def _paint_seagull(self, p, top, body, light, belly):
-        flap = math.sin(self._phase * 1.7) * 4
-
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor("#edae59"))
-        p.drawEllipse(43, int(top + 91), 29, 14)
-        p.drawEllipse(79, int(top + 91), 29, 14)
-
-        left_wing = QPainterPath()
-        left_wing.moveTo(42, top + 42)
-        left_wing.cubicTo(24, top + 51 + flap, 24, top + 72 + flap,
-                          41, top + 82)
-        left_wing.cubicTo(49, top + 68, 49, top + 54, 42, top + 42)
-        left_wing.closeSubpath()
-        self._fill_path(p, left_wing, light)
-
-        right_wing = QPainterPath()
-        right_wing.moveTo(108, top + 43)
-        right_wing.cubicTo(124, top + 49 - flap, 130, top + 36 - flap,
-                           128, top + 25 - flap)
-        right_wing.cubicTo(142, top + 43 - flap, 130, top + 68,
-                           110, top + 73)
-        right_wing.cubicTo(105, top + 64, 104, top + 52, 108, top + 43)
-        right_wing.closeSubpath()
-        self._fill_path(p, right_wing, belly, QColor(light).darker(108).name())
-
-        bird = QPainterPath()
-        bird.moveTo(75, top + 2)
-        bird.cubicTo(53, top - 1, 39, top + 16, 37, top + 45)
-        bird.cubicTo(33, top + 73, 44, top + 98, 75, top + 99)
-        bird.cubicTo(107, top + 99, 118, top + 73, 113, top + 45)
-        bird.cubicTo(111, top + 17, 97, top + 2, 75, top + 2)
-        bird.closeSubpath()
-        self._fill_path(p, bird, body, QColor(light).lighter(110).name())
-
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(belly))
-        p.drawEllipse(47, int(top + 31), 57, 58)
-
-        stem_pen = QPen(QColor("#499d75"), 3, Qt.SolidLine, Qt.RoundCap)
-        p.setPen(stem_pen)
-        p.drawLine(75, int(top + 4), 76, int(top - 12))
-        leaf = QPainterPath()
-        leaf.moveTo(75, top - 6)
-        leaf.cubicTo(63, top - 6, 59, top - 13, 60, top - 17)
-        leaf.cubicTo(69, top - 18, 75, top - 14, 75, top - 6)
-        leaf.closeSubpath()
-        self._fill_path(p, leaf, "#90d3a2")
-        leaf = QPainterPath()
-        leaf.moveTo(76, top - 9)
-        leaf.cubicTo(77, top - 18, 86, top - 23, 92, top - 21)
-        leaf.cubicTo(93, top - 14, 87, top - 8, 76, top - 9)
-        leaf.closeSubpath()
-        self._fill_path(p, leaf, "#b0e4b2")
-
-        self._paint_rounded_eyes(p, (59, 91), top + 31, "#1b3143", 11, 17)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(240, 154, 153, 145))
-        p.drawEllipse(42, int(top + 52), 15, 8)
-        p.drawEllipse(94, int(top + 52), 15, 8)
-        beak = QPainterPath()
-        beak.moveTo(66, top + 49)
-        beak.quadTo(75, top + 42, 84, top + 49)
-        beak.quadTo(81, top + 59, 75, top + 61)
-        beak.quadTo(69, top + 59, 66, top + 49)
-        beak.closeSubpath()
-        self._fill_path(p, beak, "#f8ba62")
-        p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(QColor("#d68d42"), 1.2, Qt.SolidLine, Qt.RoundCap))
-        p.drawArc(68, int(top + 47), 14, 8, 200 * 16, 140 * 16)
-
-        self._paint_mint_scarf(p, 75, top + 69)
-        self._paint_sleep_marks(p, 116, top + 29)
-
-    def _paint_cream_cat(self, p, top, body, light, belly):
-        wag = math.sin(self._phase * 1.7) * 5
-        tail = QPainterPath()
-        tail.moveTo(106, top + 75)
-        tail.cubicTo(137, top + 86 + wag, 139, top + 49 + wag,
-                     119, top + 48)
-        tail_pen = QPen(QColor(light), 14, Qt.SolidLine, Qt.RoundCap)
-        p.setPen(tail_pen)
-        p.setBrush(Qt.NoBrush)
-        p.drawPath(tail)
-
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(light))
-        p.drawEllipse(42, int(top + 91), 30, 14)
-        p.drawEllipse(79, int(top + 91), 30, 14)
-
-        cat = QPainterPath()
-        cat.moveTo(37, top + 35)
-        cat.lineTo(37, top + 2)
-        cat.quadTo(39, top - 9, 55, top + 7)
-        cat.quadTo(75, top, 95, top + 7)
-        cat.quadTo(111, top - 9, 113, top + 2)
-        cat.lineTo(113, top + 35)
-        cat.cubicTo(122, top + 69, 109, top + 99, 75, top + 99)
-        cat.cubicTo(41, top + 99, 28, top + 69, 37, top + 35)
-        cat.closeSubpath()
-        self._fill_path(p, cat, body)
-
+    def _paint_muzzle(self, painter, nose_y, nose_color, ink="#5c4b49"):
+        nose = QPainterPath(QPointF(70.5, nose_y))
+        nose.quadTo(75, nose_y - 3, 79.5, nose_y)
+        nose.quadTo(78, nose_y + 3, 75, nose_y + 4)
+        nose.quadTo(72, nose_y + 3, 70.5, nose_y)
+        self._fill_path(painter, nose, nose_color)
+        painter.setPen(QPen(QColor(ink), 1.35, Qt.SolidLine, Qt.RoundCap))
+        painter.setBrush(Qt.NoBrush)
         for direction in (-1, 1):
-            ear = QPainterPath()
-            ear.moveTo(75 + direction * 38, top + 1)
-            ear.lineTo(75 + direction * 20, top + 19)
-            ear.lineTo(75 + direction * 37, top + 22)
+            mouth = QPainterPath(QPointF(75, nose_y + 4))
+            mouth.cubicTo(75, nose_y + 10, 75 + direction * 7,
+                          nose_y + 11, 75 + direction * 9, nose_y + 7)
+            painter.drawPath(mouth)
+
+    def _paint_sleep_marks(self, painter, left, top, color="#c7d2fe"):
+        if self._pet_expression() != "sleep":
+            return
+        painter.setPen(QPen(QColor(color), 1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.setBrush(Qt.NoBrush)
+        for offset_x, offset_y, size in ((0, 0, 5), (9, -11, 7)):
+            baseline = top + offset_y + math.sin(self._phase + offset_x * .1) * 2
+            mark = QPainterPath(QPointF(left + offset_x, baseline))
+            mark.lineTo(left + offset_x + size, baseline)
+            mark.lineTo(left + offset_x, baseline + size)
+            mark.lineTo(left + offset_x + size, baseline + size)
+            painter.drawPath(mark)
+
+    def _paint_mint_scarf(self, painter, center_x, scarf_y, width=64):
+        half = width / 2
+        wrap_color = "#83cdbd" if self._state != "off" else "#a0b4b0"
+        tail_color = "#58aaa2" if self._state != "off" else "#809b96"
+        if self._pet_kind == "pixel_robot":
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing, False)
+            painter.setPen(Qt.NoPen)
+            for left, offset, span, height, color in (
+                (center_x - half, -5, width, 6, wrap_color),
+                (center_x - half + 5, 1, width - 10, 5, tail_color),
+                (center_x - 22, 5, 9, 16, tail_color),
+                (center_x - half + 4, -4, width - 8, 2, "#b8e1d4"),
+                (center_x - 21, 15, 7, 2, wrap_color),
+            ):
+                painter.setBrush(QColor(color))
+                painter.drawRect(int(left), int(round(scarf_y + offset)), int(span), height)
+            painter.restore()
+            return
+
+        sway = math.sin(self._phase * 1.4) * 1.4
+        tail = QPainterPath(QPointF(center_x - 13, scarf_y + 3))
+        tail.cubicTo(center_x - 14, scarf_y + 12, center_x - 9 + sway,
+                     scarf_y + 21, center_x - 5 + sway, scarf_y + 26)
+        tail.quadTo(center_x + 2 + sway, scarf_y + 27,
+                     center_x + 7 + sway, scarf_y + 22)
+        tail.lineTo(center_x + 1, scarf_y + 4)
+        tail.closeSubpath()
+        self._fill_path(painter, tail, self._pet_gradient(tail_color, scarf_y, 28))
+        wrap = QPainterPath(QPointF(center_x - half, scarf_y - 6))
+        wrap.cubicTo(center_x - 13, scarf_y + 1, center_x + 14, scarf_y + 2,
+                     center_x + half, scarf_y - 6)
+        wrap.lineTo(center_x + half - 3, scarf_y + 4)
+        wrap.cubicTo(center_x + 12, scarf_y + 12, center_x - 14, scarf_y + 11,
+                     center_x - half + 3, scarf_y + 4)
+        wrap.closeSubpath()
+        painter.save()
+        painter.translate(0, 1.5)
+        self._fill_path(painter, wrap, QColor(28, 65, 70, 35))
+        painter.restore()
+        self._fill_path(painter, wrap, self._pet_gradient(wrap_color, scarf_y - 5, 18))
+        seam = QPainterPath(QPointF(center_x - half + 7, scarf_y - 1))
+        seam.cubicTo(center_x - 12, scarf_y + 5, center_x + 14, scarf_y + 6,
+                     center_x + half - 7, scarf_y - 1)
+        self._fill_path(painter, seam, Qt.NoBrush, "#c6e9dc", 1.1)
+        painter.setPen(QPen(QColor("#a5d9ca"), 1.0, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(QPointF(center_x - 8 + sway, scarf_y + 18),
+                         QPointF(center_x + 1 + sway, scarf_y + 15))
+
+    def _paint_seagull(self, painter, top, body, light, belly):
+        flap = math.sin(self._phase * 1.7) * 3
+        feet_color = "#e9b667" if self._state != "off" else "#a4aaa9"
+        self._paint_paws(painter, top, feet_color, (54, 96), 24)
+        right_wing = QPainterPath(QPointF(108, top + 46))
+        right_wing.cubicTo(124, top + 52 - flap, 133, top + 39 - flap,
+                           130, top + 28 - flap)
+        right_wing.cubicTo(142, top + 45 - flap, 134, top + 68, 111, top + 80)
+        right_wing.quadTo(103, top + 62, 108, top + 46)
+        self._fill_path(painter, right_wing, self._pet_gradient(light, top + 30, 55),
+                        QColor(light).darker(108), .85)
+
+        bird = QPainterPath(QPointF(72, top + 5))
+        bird.cubicTo(43, top + 1, 32, top + 28, 32, top + 58)
+        bird.cubicTo(29, top + 87, 45, top + 101, 75, top + 102)
+        bird.cubicTo(108, top + 103, 122, top + 83, 117, top + 55)
+        bird.cubicTo(115, top + 27, 103, top + 8, 87, top + 6)
+        bird.cubicTo(89, top - 3, 81, top - 5, 72, top + 5)
+        self._paint_soft_body(painter, bird, top, body)
+        belly_glow = QColor(belly)
+        belly_glow.setAlpha(100)
+        self._pet_ellipse(painter, 44, top + 35, 64, 60, belly_glow)
+
+        left_wing = QPainterPath(QPointF(37, top + 46))
+        left_wing.cubicTo(23, top + 55 + flap, 25, top + 77, 42, top + 86)
+        left_wing.cubicTo(49, top + 72, 47, top + 56, 37, top + 46)
+        self._fill_path(painter, left_wing, self._pet_gradient(light, top + 42, 48))
+        feather = QPainterPath(QPointF(33, top + 61))
+        feather.quadTo(34, top + 72, 40, top + 77)
+        self._fill_path(painter, feather, Qt.NoBrush, QColor(belly), 1.1)
+
+        self._paint_rounded_eyes(painter, (59, 91), top + 35, "#263d4d", 10, 15)
+        self._paint_cheeks(painter, top + 52)
+        beak = QPainterPath(QPointF(67, top + 54))
+        beak.quadTo(75, top + 49, 83, top + 54)
+        beak.quadTo(80, top + 63, 75, top + 64)
+        beak.quadTo(70, top + 63, 67, top + 54)
+        self._fill_path(painter, beak, self._pet_gradient(feet_color, top + 50, 14))
+        beak_fold = QPainterPath(QPointF(69, top + 55))
+        beak_fold.quadTo(75, top + 58, 81, top + 55)
+        self._fill_path(painter, beak_fold, Qt.NoBrush, QColor(feet_color).darker(119), .9)
+        self._paint_sleep_marks(painter, 116, top + 23)
+
+    def _paint_cream_cat(self, painter, top, body, light, belly):
+        self._paint_cat_character(painter, top, body, light, belly)
+
+    def _paint_cat_character(self, painter, top, body, light, belly):
+        cream = self._pet_kind == "cream_cat"
+        dark = self._pet_kind == "charcoal_cat"
+        wag = math.sin(self._phase * 1.7) * 5
+        tail_color = light if cream else body
+        tail = QPainterPath(QPointF(108, top + 84))
+        tail.cubicTo(137, top + 90, 141, top + 58 + wag, 123, top + 54 + wag)
+        self._fill_path(painter, tail, Qt.NoBrush, QColor(tail_color).darker(106), 11)
+        self._fill_path(painter, tail, Qt.NoBrush, QColor(tail_color).lighter(111), 3)
+
+        ear_height = 9 if cream else 5
+        cat = QPainterPath(QPointF(34, top + 32))
+        cat.cubicTo(32, top + 17, 31, top - ear_height, 38, top - ear_height)
+        cat.quadTo(44, top - ear_height - 2, 58, top + 10)
+        cat.quadTo(75, top + 3, 94, top + 10)
+        cat.quadTo(108, top - ear_height - 2, 113, top - ear_height + 2)
+        cat.quadTo(118, top, 115, top + 32)
+        cat.cubicTo(126, top + 49, 121, top + 72, 111, top + 83)
+        cat.cubicTo(113, top + 100, 97, top + 103, 75, top + 103)
+        cat.cubicTo(51, top + 103, 37, top + 100, 38, top + 82)
+        cat.cubicTo(26, top + 72, 24, top + 50, 34, top + 32)
+        self._paint_soft_body(painter, cat, top, body)
+        for direction in (-1, 1):
+            ear = QPainterPath(QPointF(75 + direction * 36, top + 3 - ear_height * .25))
+            ear.quadTo(75 + direction * 35, top + 12, 75 + direction * 35, top + 22)
+            ear.lineTo(75 + direction * 23, top + 17)
             ear.closeSubpath()
-            self._fill_path(p, ear, "#e9ac9a")
+            self._fill_path(painter, ear, "#d6adba" if dark else "#eac2c0")
 
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(belly))
-        p.drawEllipse(44, int(top + 30), 62, 60)
-        stripe = QColor(light).darker(105)
-        p.setBrush(stripe)
-        for x, height in ((55, 14), (70, 19), (85, 14)):
-            p.drawRoundedRect(x, int(top + 15), 8, height, 4, 4)
-
-        self._paint_rounded_eyes(p, (60, 90), top + 39, "#493b39", 11, 16)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(239, 182, 165, 170))
-        p.drawEllipse(42, int(top + 58), 15, 8)
-        p.drawEllipse(94, int(top + 58), 15, 8)
-        nose = QPainterPath()
-        nose.moveTo(69, top + 57)
-        nose.quadTo(75, top + 53, 81, top + 57)
-        nose.lineTo(75, top + 63)
-        nose.closeSubpath()
-        self._fill_path(p, nose, "#b7736b")
-        p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(QColor("#745248"), 1.8, Qt.SolidLine, Qt.RoundCap))
-        p.drawArc(61, int(top + 58), 14, 13, 210 * 16, 120 * 16)
-        p.drawArc(75, int(top + 58), 14, 13, 210 * 16, 120 * 16)
-
-        self._paint_mint_scarf(p, 75, top + 70)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor("#f6d274"))
-        p.drawEllipse(70, int(top + 78), 10, 10)
-        self._paint_sleep_marks(p, 116, top + 28, "#a78bfa")
-
-    def _paint_pixel_robot(self, p, top, body, light, belly):
-        y = int(top - 8)
-        p.save()
-        p.setRenderHint(QPainter.Antialiasing, False)
-
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(light).darker(112))
-        p.drawRect(72, y - 8, 7, 14)
-        p.setBrush(QColor("#b8a6f1") if self._state != "off" else QColor("#94a3b8"))
-        p.drawRect(68, y - 13, 15, 8)
-
-        p.setBrush(QColor(light).darker(105))
-        p.drawRect(24, y + 15, 10, 28)
-        p.drawRect(116, y + 15, 10, 28)
-        p.setBrush(QColor(body))
-        p.drawRect(31, y, 88, 58)
-        p.setBrush(QColor(body).lighter(122))
-        p.drawRect(35, y + 4, 80, 5)
-        p.setBrush(QColor(belly))
-        p.drawRect(40, y + 13, 70, 34)
-
-        eye = QColor("#87eee1") if self._state != "off" else QColor("#94a3b8")
-        p.setBrush(eye)
-        closed = self._blink > 0 or self._state == "resting"
-        if closed:
-            p.drawRect(50, y + 29, 13, 3)
-            p.drawRect(87, y + 29, 13, 3)
+        if dark:
+            chest = QPainterPath(QPointF(56, top + 66))
+            chest.quadTo(75, top + 73, 94, top + 66)
+            chest.quadTo(92, top + 92, 75, top + 96)
+            chest.quadTo(58, top + 92, 56, top + 66)
+            self._fill_path(painter, chest, belly)
+            self._pet_ellipse(painter, 61, top + 56, 16, 14, belly)
+            self._pet_ellipse(painter, 73, top + 56, 16, 14, belly)
+            moon = QPainterPath()
+            moon.addEllipse(QRectF(67, top + 16, 13, 13))
+            cutout = QPainterPath()
+            cutout.addEllipse(QRectF(72, top + 13, 12, 13))
+            self._fill_path(painter, moon.subtracted(cutout), "#e8d4a2")
         else:
-            eye_height = 6 if self._state == "tired" else 10
-            eye_y = y + (24 if self._state == "tired" else 21)
-            look_x = int(round(self._look[0] / 2))
-            look_y = int(round(self._look[1] / 2))
-            p.drawRect(51 + look_x, eye_y + look_y, 11, eye_height)
-            p.drawRect(88 + look_x, eye_y + look_y, 11, eye_height)
-        p.drawRect(66, y + 38, 18, 3)
+            mask = QPainterPath(QPointF(75, top + 37))
+            mask.cubicTo(57, top + 24, 37, top + 34, 39, top + 57)
+            mask.cubicTo(39, top + 80, 57, top + 92, 75, top + 94)
+            mask.cubicTo(95, top + 91, 113, top + 78, 111, top + 55)
+            mask.cubicTo(112, top + 35, 93, top + 26, 75, top + 37)
+            self._fill_path(painter, mask, self._pet_gradient(belly, top + 30, 70))
+            if cream:
+                for stripe_x, height in ((62, 13), (75, 18), (88, 13)):
+                    stripe = QPainterPath(QPointF(stripe_x - 3, top + 14))
+                    stripe.quadTo(stripe_x, top + 11, stripe_x + 3, top + 14)
+                    stripe.quadTo(stripe_x + 3, top + 22, stripe_x, top + 14 + height)
+                    stripe.quadTo(stripe_x - 3, top + 22, stripe_x - 3, top + 14)
+                    self._fill_path(painter, stripe, light)
+            else:
+                tuft = QPainterPath(QPointF(65, top + 17))
+                tuft.quadTo(72, top + 21, 73, top + 27)
+                tuft.quadTo(77, top + 20, 85, top + 19)
+                self._fill_path(painter, tuft, Qt.NoBrush, light, 2.2)
 
-        p.setBrush(QColor(body).darker(112))
-        p.drawRect(45, y + 66, 60, 43)
-        p.setBrush(QColor(light))
-        p.drawRect(52, y + 73, 46, 27)
-        p.setBrush(QColor(body))
-        p.drawRect(32, y + 69, 10, 31)
-        p.drawRect(108, y + 69, 10, 31)
+        self._paint_paws(painter, top, light if cream else body)
+        self._paint_rounded_eyes(painter, (58, 92), top + 39,
+                                 "#e4c891" if dark else "#304352", 10.5, 15)
+        self._paint_cheeks(painter, top + 57)
+        self._paint_muzzle(painter, top + 58, "#bc8991" if not dark else "#d5a9ad")
+        whisker_color = QColor("#d9e5ee" if dark else "#8e9daa")
+        whisker_color.setAlpha(135)
+        painter.setPen(QPen(whisker_color, 1.05, Qt.SolidLine, Qt.RoundCap))
+        for direction in (-1, 1):
+            for offset in (0, 5):
+                painter.drawLine(QPointF(75 + direction * 30, top + 60 + offset),
+                                 QPointF(75 + direction * 41, top + 58 + offset * 1.4))
+        self._paint_sleep_marks(painter, 118, top + 23)
 
-        heart = QColor("#fac2c0") if self._state != "off" else QColor("#94a3b8")
-        p.setBrush(heart)
-        for pixel_x, pixel_y in ((69, 80), (76, 80), (64, 85), (69, 85),
-                                 (76, 85), (81, 85), (69, 90), (76, 90),
-                                 (72, 95)):
-            p.drawRect(pixel_x, y + pixel_y, 5, 5)
+    def _paint_pixel_robot(self, painter, top, body, light, belly):
+        baseline = int(round(top - 5))
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setPen(Qt.NoPen)
 
-        p.setBrush(QColor(light).darker(108))
-        p.drawRect(49, y + 109, 23, 10)
-        p.drawRect(78, y + 109, 23, 10)
-        p.restore()
-        self._paint_sleep_marks(p, 119, top + 22, "#b8a6f1")
+        def block(left, offset, width, height, color):
+            painter.setBrush(QColor(color))
+            painter.drawRect(left, baseline + offset, width, height)
+
+        edge = QColor(light).darker(118)
+        shine = QColor(body).lighter(121)
+        screen_ink = "#98e5d8" if self._state != "off" else "#93a4ad"
+        if self._decoration != "sprout":
+            block(73, -10, 4, 15, light)
+            block(69, -14, 12, 8, "#c5b6e8" if self._state != "off" else light)
+            block(71, -13, 4, 2, "#e9e2f8")
+        block(27, 19, 8, 23, edge)
+        block(115, 19, 8, 23, edge)
+        block(29, 20, 3, 18, light)
+        block(118, 20, 3, 18, light)
+        block(39, 4, 72, 55, edge)
+        block(35, 8, 80, 47, body)
+        block(39, 4, 72, 49, body)
+        block(39, 5, 69, 3, shine)
+        block(36, 10, 3, 40, shine)
+        block(111, 10, 4, 44, light)
+        block(39, 53, 72, 4, light)
+        block(41, 13, 68, 36, edge)
+        block(44, 16, 62, 30, belly)
+        block(45, 17, 37, 2, QColor(217, 239, 242, 35))
+
+        expression = self._pet_expression()
+        for eye_x in (51, 89):
+            if expression in ("sleep", "blink"):
+                block(eye_x, 29, 10, 2, screen_ink)
+            elif expression == "happy":
+                block(eye_x, 26, 3, 6, screen_ink)
+                block(eye_x + 3, 23, 4, 3, screen_ink)
+                block(eye_x + 7, 26, 3, 6, screen_ink)
+            else:
+                eye_height = 5 if expression == "tired" else 10
+                eye_y = 26 if expression == "tired" else 22
+                look_x = int(round(self._look[0] / 2))
+                look_y = int(round(self._look[1] / 2))
+                block(eye_x + look_x, eye_y + look_y, 10, eye_height, screen_ink)
+                block(eye_x + look_x + 1, eye_y + look_y + 1, 2, 2, shine)
+        block(70, 38, 3, 3, screen_ink)
+        block(73, 41, 6, 2, screen_ink)
+        block(79, 38, 3, 3, screen_ink)
+        if self._state != "off":
+            block(47, 35, 6, 2, "#c597aa")
+            block(98, 35, 6, 2, "#c597aa")
+
+        block(69, 59, 12, 6, edge)
+        block(50, 65, 50, 36, body)
+        block(52, 66, 46, 3, shine)
+        block(50, 97, 50, 4, light)
+        block(59, 75, 33, 22, light)
+        block(62, 77, 27, 18, belly)
+        block(37, 69, 9, 24, body)
+        block(104, 69, 9, 24, body)
+        block(38, 69, 3, 18, shine)
+        block(105, 69, 3, 18, shine)
+        block(37, 91, 9, 5, light)
+        block(104, 91, 9, 5, light)
+        heart = "#f0b6b6" if self._state != "off" else "#93a4ad"
+        for row_index, row in enumerate(("01010", "11111", "11111", "01110", "00100")):
+            for column_index, pixel in enumerate(row):
+                if pixel == "1":
+                    block(68 + column_index * 3, 79 + row_index * 3, 3, 3, heart)
+        for screw_x in (54, 95):
+            block(screw_x, 71, 2, 2, edge)
+        block(56, 101, 11, 5, edge)
+        block(83, 101, 11, 5, edge)
+        block(50, 106, 20, 8, light)
+        block(80, 106, 20, 8, light)
+        block(51, 106, 18, 2, body)
+        block(81, 106, 18, 2, body)
+        painter.restore()
+        self._paint_sleep_marks(painter, 119, top + 22, "#c5b6e8")
+
+    # 旧版的六款角色都走同一套圆身 fallback，看起来像换了颜色的同一只宠物。
+    # 这里保留轻量 QPainter 方案，但给每个角色独立轮廓、脸型和标志性细节。
+    def _paint_blue_cat(self, painter, top, body, light, belly):
+        self._paint_cat_character(painter, top, body, light, belly)
+
+    def _paint_orange_fox(self, painter, top, body, light, belly):
+        wag = math.sin(self._phase * 1.5) * 3
+        tail = QPainterPath(QPointF(106, top + 91))
+        tail.cubicTo(139, top + 95, 145, top + 66 + wag, 132, top + 47 + wag)
+        tail.quadTo(121, top + 31 + wag, 125, top + 21 + wag)
+        tail.cubicTo(108, top + 29, 104, top + 48, 113, top + 64)
+        tail.quadTo(96, top + 75, 106, top + 91)
+        self._paint_soft_body(painter, tail, top + 20, body)
+        painter.save()
+        painter.setClipPath(tail)
+        tail_tip = QPainterPath(QPointF(108, top + 13 + wag))
+        tail_tip.lineTo(140, top + 13 + wag)
+        tail_tip.lineTo(137, top + 49 + wag)
+        tail_tip.quadTo(125, top + 43 + wag, 113, top + 49 + wag)
+        tail_tip.closeSubpath()
+        self._fill_path(painter, tail_tip, belly)
+        painter.restore()
+
+        fox = QPainterPath(QPointF(36, top + 32))
+        fox.cubicTo(36, top + 19, 35, top - 7, 41, top - 9)
+        fox.quadTo(45, top - 10, 59, top + 16)
+        fox.quadTo(75, top + 9, 91, top + 16)
+        fox.quadTo(105, top - 10, 110, top - 8)
+        fox.quadTo(117, top + 2, 115, top + 32)
+        fox.lineTo(123, top + 47)
+        fox.lineTo(118, top + 56)
+        fox.lineTo(126, top + 61)
+        fox.quadTo(117, top + 73, 108, top + 80)
+        fox.cubicTo(111, top + 96, 94, top + 102, 75, top + 102)
+        fox.cubicTo(53, top + 102, 37, top + 94, 42, top + 80)
+        fox.quadTo(29, top + 72, 24, top + 62)
+        fox.lineTo(32, top + 56)
+        fox.lineTo(28, top + 48)
+        fox.closeSubpath()
+        self._paint_soft_body(painter, fox, top, body)
+        for direction in (-1, 1):
+            ear = QPainterPath(QPointF(75 + direction * 33, top + 1))
+            ear.lineTo(75 + direction * 32, top + 26)
+            ear.lineTo(75 + direction * 22, top + 20)
+            ear.closeSubpath()
+            self._fill_path(painter, ear, "#98756b")
+
+        mask = QPainterPath(QPointF(75, top + 48))
+        mask.cubicTo(62, top + 44, 60, top + 31, 45, top + 34)
+        mask.cubicTo(34, top + 40, 36, top + 63, 48, top + 70)
+        mask.cubicTo(54, top + 93, 93, top + 101, 101, top + 72)
+        mask.cubicTo(118, top + 61, 116, top + 40, 106, top + 34)
+        mask.cubicTo(90, top + 31, 88, top + 44, 75, top + 48)
+        self._fill_path(painter, mask, self._pet_gradient(belly, top + 32, 65))
+        self._paint_paws(painter, top, QColor(body).darker(113), width=23)
+        self._paint_rounded_eyes(painter, (58, 92), top + 40, "#594338", 10, 13)
+        self._paint_cheeks(painter, top + 57)
+        self._paint_muzzle(painter, top + 57, "#6a4b43")
+        self._paint_sleep_marks(painter, 116, top + 24, "#e8cbaa")
+
+    def _paint_mint_bunny(self, painter, top, body, light, belly):
+        sway = math.sin(self._phase * 1.1) * 2
+        left_ear = QPainterPath(QPointF(41, top + 31))
+        left_ear.cubicTo(30, top + 5, 28, top - 27, 39, top - 28)
+        left_ear.cubicTo(51, top - 28, 56, top + 2, 55, top + 31)
+        left_ear.closeSubpath()
+        self._paint_soft_body(painter, left_ear, top - 28, body)
+        right_ear = QPainterPath(QPointF(92, top + 29))
+        right_ear.cubicTo(88, top + 3, 98 + sway, top - 27, 109 + sway, top - 19)
+        right_ear.cubicTo(118 + sway, top - 9, 107, top + 15, 107, top + 32)
+        right_ear.closeSubpath()
+        self._paint_soft_body(painter, right_ear, top - 22, body)
+        inner_ear = QPainterPath(QPointF(41, top + 19))
+        inner_ear.cubicTo(36, top + 1, 34, top - 19, 39, top - 19)
+        inner_ear.cubicTo(45, top - 20, 49, top + 3, 48, top + 21)
+        self._fill_path(painter, inner_ear, "#e6c9ce")
+        inner_ear = QPainterPath(QPointF(98, top + 20))
+        inner_ear.cubicTo(96, top + 3, 102 + sway, top - 15, 107 + sway, top - 13)
+        inner_ear.cubicTo(112, top - 7, 103, top + 9, 103, top + 22)
+        self._fill_path(painter, inner_ear, "#e6c9ce")
+        self._pet_ellipse(painter, 113, top + 76, 21, 21,
+                          self._pet_gradient(belly, top + 74, 24))
+        bunny = QPainterPath(QPointF(75, top + 19))
+        bunny.cubicTo(47, top + 16, 28, top + 34, 30, top + 59)
+        bunny.cubicTo(25, top + 85, 45, top + 102, 75, top + 103)
+        bunny.cubicTo(106, top + 103, 123, top + 84, 120, top + 58)
+        bunny.cubicTo(122, top + 34, 102, top + 16, 75, top + 19)
+        self._paint_soft_body(painter, bunny, top + 16, body)
+        self._pet_ellipse(painter, 41, top + 36, 68, 58,
+                          self._pet_gradient(belly, top + 36, 60))
+        self._paint_paws(painter, top, light, width=27)
+        self._paint_rounded_eyes(painter, (59, 91), top + 42, "#38594e", 10, 14)
+        self._paint_cheeks(painter, top + 58)
+        self._paint_muzzle(painter, top + 59, "#c58e9f", "#62877a")
+        painter.setPen(QPen(QColor("#c1d6cc"), .65))
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawRoundedRect(QRectF(72, top + 65, 6, 6), 1.5, 1.5)
+        painter.drawLine(QPointF(75, top + 66), QPointF(75, top + 70))
+        self._paint_sleep_marks(painter, 116, top + 26, "#b3dac8")
+
+    def _paint_purple_owl(self, painter, top, body, light, belly):
+        owl = QPainterPath(QPointF(75, top + 11))
+        owl.quadTo(55, top + 6, 40, top - 1)
+        owl.quadTo(34, top + 9, 38, top + 21)
+        owl.cubicTo(28, top + 39, 27, top + 68, 40, top + 86)
+        owl.cubicTo(53, top + 108, 98, top + 108, 111, top + 86)
+        owl.cubicTo(124, top + 66, 121, top + 38, 112, top + 21)
+        owl.quadTo(115, top + 8, 110, top - 1)
+        owl.quadTo(96, top + 6, 75, top + 11)
+        self._paint_soft_body(painter, owl, top, body)
+        self._pet_ellipse(painter, 48, top + 55, 54, 43,
+                          self._pet_gradient(light, top + 50, 50))
+        mask = QPainterPath(QPointF(75, top + 35))
+        mask.cubicTo(57, top + 15, 34, top + 31, 40, top + 50)
+        mask.cubicTo(44, top + 64, 63, top + 73, 75, top + 78)
+        mask.cubicTo(89, top + 72, 107, top + 62, 111, top + 49)
+        mask.cubicTo(116, top + 28, 92, top + 16, 75, top + 35)
+        self._fill_path(painter, mask, self._pet_gradient(belly, top + 24, 55))
+        for direction in (-1, 1):
+            wing = QPainterPath(QPointF(75 + direction * 37, top + 46))
+            wing.cubicTo(75 + direction * 54, top + 47,
+                         75 + direction * 52, top + 76,
+                         75 + direction * 34, top + 87)
+            wing.quadTo(75 + direction * 29, top + 69,
+                        75 + direction * 37, top + 46)
+            self._fill_path(painter, wing, self._pet_gradient(body, top + 40, 45),
+                            QColor(body).darker(115), .85)
+            for offset in (0, 6):
+                feather = QPainterPath(QPointF(75 + direction * 44, top + 58 + offset))
+                feather.quadTo(75 + direction * 43, top + 68 + offset,
+                               75 + direction * 37, top + 73 + offset)
+                self._fill_path(painter, feather, Qt.NoBrush, light, 1)
+        self._paint_paws(painter, top, "#d5b888", (57, 93), 18)
+        self._paint_rounded_eyes(painter, (58, 92), top + 36, "#49425f", 13, 18)
+        self._paint_cheeks(painter, top + 57, (45, 105))
+        beak = QPainterPath(QPointF(69, top + 58))
+        beak.quadTo(75, top + 53, 81, top + 58)
+        beak.quadTo(78, top + 65, 75, top + 68)
+        beak.quadTo(72, top + 65, 69, top + 58)
+        self._fill_path(painter, beak, self._pet_gradient("#e8bf7d", top + 54, 14))
+        for center_x in (63, 75, 87):
+            feather = QPainterPath(QPointF(center_x - 2, top + 89))
+            feather.quadTo(center_x, top + 93, center_x + 2, top + 89)
+            self._fill_path(painter, feather, Qt.NoBrush, QColor(body).darker(111), 1.1)
+        self._paint_sleep_marks(painter, 118, top + 23, "#ded4ef")
+
+    def _paint_pink_poodle(self, painter, top, body, light, belly):
+        tail = QPainterPath(QPointF(109, top + 83))
+        tail.cubicTo(132, top + 88, 135, top + 72, 128, top + 64)
+        self._fill_path(painter, tail, Qt.NoBrush, QColor(body).darker(108), 5)
+        self._pet_ellipse(painter, 117, top + 55, 21, 20,
+                          self._pet_gradient(light, top + 53, 24))
+        dog = QPainterPath(QPointF(75, top + 24))
+        dog.cubicTo(46, top + 19, 31, top + 40, 35, top + 65)
+        dog.cubicTo(29, top + 90, 47, top + 103, 75, top + 103)
+        dog.cubicTo(106, top + 103, 122, top + 87, 115, top + 65)
+        dog.cubicTo(119, top + 38, 103, top + 19, 75, top + 24)
+        self._paint_soft_body(painter, dog, top + 20, body)
+        for mirrored in (False, True):
+            painter.save()
+            if mirrored:
+                painter.translate(150, 0)
+                painter.scale(-1, 1)
+            ear = QPainterPath(QPointF(44, top + 30))
+            ear.cubicTo(28, top + 23, 22, top + 38, 27, top + 49)
+            ear.cubicTo(20, top + 59, 23, top + 77, 36, top + 80)
+            ear.cubicTo(48, top + 82, 54, top + 68, 48, top + 57)
+            ear.quadTo(53, top + 41, 44, top + 30)
+            self._paint_soft_body(painter, ear, top + 29, light)
+            for curl_y in (43, 58):
+                curl = QPainterPath(QPointF(30, top + curl_y))
+                curl.cubicTo(37, top + curl_y - 5, 43, top + curl_y + 1,
+                             36, top + curl_y + 5)
+                self._fill_path(painter, curl, Qt.NoBrush, QColor(body).darker(105), .9)
+            painter.restore()
+
+        curls = QPainterPath()
+        curls.setFillRule(Qt.WindingFill)
+        for curl_x, curl_y, diameter in ((42, 11, 29), (61, 5, 31), (82, 12, 27)):
+            curls.addEllipse(QRectF(curl_x, top + curl_y, diameter, diameter))
+        self._paint_soft_body(painter, curls.simplified(), top + 4, light)
+        curl = QPainterPath(QPointF(69, top + 17))
+        curl.cubicTo(72, top + 12, 81, top + 16, 76, top + 22)
+        self._fill_path(painter, curl, Qt.NoBrush, QColor(body).darker(105), 1.2)
+        self._pet_ellipse(painter, 45, top + 48, 60, 40,
+                          self._pet_gradient(belly, top + 45, 45))
+        self._paint_paws(painter, top, light, width=27)
+        self._paint_rounded_eyes(painter, (59, 91), top + 42, "#594657", 10, 14)
+        self._paint_cheeks(painter, top + 59)
+        self._paint_muzzle(painter, top + 59, "#705164", "#876779")
+        if self._pet_expression() == "happy":
+            self._pet_ellipse(painter, 72, top + 65, 6, 7, "#dc9cad")
+        self._paint_sleep_marks(painter, 118, top + 24, "#ecd0e0")
+
+    def _paint_charcoal_cat(self, painter, top, body, light, belly):
+        self._paint_cat_character(painter, top, body, light, belly)
+
+    def _paint_decoration(self, painter, top, decoration):
+        """绘制独立于角色本体的可切换装饰。"""
+        if decoration == "scarf":
+            scarf_y = top + (63 if self._pet_kind == "pixel_robot" else 70)
+            width = 54 if self._pet_kind == "pixel_robot" else 64
+            self._paint_mint_scarf(painter, 75, scarf_y, width)
+        elif decoration == "sprout":
+            if self._pet_kind == "pixel_robot":
+                painter.save()
+                painter.setRenderHint(QPainter.Antialiasing, False)
+                painter.setPen(Qt.NoPen)
+                for left, offset, width, height, color in (
+                    (74, -17, 3, 17, "#71a487"), (65, -19, 9, 5, "#8dcaa4"),
+                    (62, -23, 8, 6, "#9ad4ac"), (77, -24, 10, 6, "#b2dfb6"),
+                    (81, -28, 8, 5, "#b2dfb6"),
+                ):
+                    painter.setBrush(QColor(color))
+                    painter.drawRect(left, int(round(top + offset)), width, height)
+                painter.restore()
+                return
+            anchor = top + (13 if self._pet_kind == "mint_bunny" else 4)
+            stem = QPainterPath(QPointF(75, anchor))
+            stem.quadTo(78, anchor - 10, 76, anchor - 18)
+            self._fill_path(painter, stem, Qt.NoBrush, "#6b9f80", 1.8)
+            leaf = QPainterPath(QPointF(76, anchor - 10))
+            leaf.cubicTo(61, anchor - 9, 59, anchor - 16, 59, anchor - 21)
+            leaf.cubicTo(69, anchor - 23, 77, anchor - 20, 76, anchor - 10)
+            self._fill_path(painter, leaf, self._pet_gradient("#91cba3", anchor - 22, 15))
+            leaf = QPainterPath(QPointF(77, anchor - 14))
+            leaf.cubicTo(77, anchor - 26, 88, anchor - 29, 94, anchor - 27)
+            leaf.cubicTo(95, anchor - 18, 85, anchor - 12, 77, anchor - 14)
+            self._fill_path(painter, leaf, self._pet_gradient("#b0dcb3", anchor - 28, 16))
+        elif decoration == "star_pin":
+            star = QPainterPath()
+            for point_index in range(10):
+                angle = point_index * math.pi / 5 - math.pi / 2
+                radius = 8 if point_index % 2 == 0 else 3.8
+                point = QPointF(111 + math.cos(angle) * radius, top + 8 + math.sin(angle) * radius)
+                if point_index == 0:
+                    star.moveTo(point)
+                else:
+                    star.lineTo(point)
+            star.closeSubpath()
+            self._fill_path(painter, star, "#e5ca8c")
+        elif decoration == "night_cap":
+            cap = QPainterPath(QPointF(46, top + 12))
+            cap.quadTo(75, top - 31, 105, top + 12)
+            cap.closeSubpath()
+            self._fill_path(painter, cap, self._pet_gradient("#9b9fc4", top - 20, 34))
+            painter.setPen(QPen(QColor("#e4dff2"), 3, Qt.SolidLine, Qt.RoundCap))
+            painter.drawLine(QPointF(49, top + 12), QPointF(101, top + 12))
+            self._pet_ellipse(painter, 96, top - 16, 9, 9, "#e5ca8c")
 
     def _paint_ears(self, p, top, light, belly, ear_style):
         p.setPen(Qt.NoPen)
@@ -1508,36 +2463,126 @@ class DesktopPet(QWidget):
         p.drawText(inner, Qt.AlignCenter,
                    QFontMetrics(f).elidedText(self._msg, Qt.ElideRight, inner.width()))
 
+    def _paint_interaction_fx(self, p):
+        """绘制不会污染角色 renderer 的临时粒子和触摸波纹。"""
+        for ripple in getattr(self, "_ripples", ()):
+            ratio = max(0.0, min(1.0, ripple["life"] / ripple["max_life"]))
+            color = QColor(self.INTERACTION_MODES[self._interaction_mode]["color"])
+            color.setAlpha(int(120 * ratio))
+            radius = ripple["radius"]
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(color, max(.7, 1.4 * ratio)))
+            p.drawEllipse(int(ripple["x"] - radius), int(ripple["y"] - radius),
+                          int(radius * 2), int(radius * 2))
+
+        for particle in getattr(self, "_particles", ()):
+            ratio = max(0.0, min(1.0,
+                                 particle["life"] / particle["max_life"]))
+            color = QColor(particle["color"])
+            color.setAlpha(int(225 * ratio))
+            x, y, size = particle["x"], particle["y"], particle["size"]
+            kind = particle["kind"]
+            p.save()
+            p.translate(x, y)
+            p.rotate(math.degrees(particle["rotation"]))
+            if kind == "bubble":
+                fill = QColor(color)
+                fill.setAlpha(int(45 * ratio))
+                p.setBrush(fill)
+                p.setPen(QPen(color, 1.0))
+                p.drawEllipse(int(-size), int(-size), int(size * 2), int(size * 2))
+                shine = QColor(255, 255, 255, int(155 * ratio))
+                p.setPen(Qt.NoPen)
+                p.setBrush(shine)
+                p.drawEllipse(int(-size * .38), int(-size * .44),
+                              max(1, int(size * .42)), max(1, int(size * .35)))
+            elif kind == "heart":
+                heart = QPainterPath()
+                heart.moveTo(0, size * .85)
+                heart.cubicTo(-size * 2.0, -size * .25, -size * .95,
+                              -size * 1.75, 0, -size * .55)
+                heart.cubicTo(size * .95, -size * 1.75, size * 2.0,
+                              -size * .25, 0, size * .85)
+                p.setPen(Qt.NoPen)
+                p.setBrush(color)
+                p.drawPath(heart)
+            else:
+                # star / spark：不依赖 emoji 字体，打包后的 Windows 也稳定。
+                p.setPen(QPen(color, max(1.0, size * .36),
+                              Qt.SolidLine, Qt.RoundCap))
+                arm = size * (1.35 if kind == "star" else .9)
+                p.drawLine(int(-arm), 0, int(arm), 0)
+                p.drawLine(0, int(-arm), 0, int(arm))
+                if kind == "star":
+                    diagonal = arm * .62
+                    p.drawLine(int(-diagonal), int(-diagonal),
+                               int(diagonal), int(diagonal))
+                    p.drawLine(int(-diagonal), int(diagonal),
+                               int(diagonal), int(-diagonal))
+            p.restore()
+
     # ── 交互 ──────────────────────────────────
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self._drag_from = event.globalPos() - self.frameGeometry().topLeft()
+            # 默认“自由移动”保留传统桌宠的左键拖动；互动模式用 Shift+拖动移动，
+            # 避免与“拉长长”/“抛一下”的拖动手势冲突。
+            self._window_dragging = (
+                self._interaction_mode == "move" or
+                bool(event.modifiers() & Qt.ShiftModifier)
+            )
             self._dragged = False
+            if self._window_dragging:
+                self.cancel_interaction()
+                self._drag_from = event.globalPos() - self.frameGeometry().topLeft()
+                self.setCursor(Qt.ClosedHandCursor)
+            else:
+                self._drag_from = None
+                self._begin_interaction(event.x(), event.y(),
+                                        event.globalX(), event.globalY())
             event.accept()
         elif event.button() == Qt.RightButton:
+            self.cancel_interaction()
             self._show_menu(event.globalPos())
             event.accept()
 
     def mouseMoveEvent(self, event):
-        if self._drag_from is not None and event.buttons() & Qt.LeftButton:
+        if not event.buttons() & Qt.LeftButton:
+            return
+        if self._window_dragging and self._drag_from is not None:
             self.move(event.globalPos() - self._drag_from)
             self._dragged = True
             event.accept()
+        elif self._interaction_active:
+            self._update_drag_interaction(event.x(), event.y(),
+                                          event.globalX(), event.globalY())
+            start_x, start_y = self._interaction_global_start
+            self._dragged = (math.hypot(event.globalX() - start_x,
+                                        event.globalY() - start_y) > 5.0)
+            event.accept()
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton and self._drag_from is not None:
-            self._drag_from = None
-            if self._dragged:
+        if event.button() == Qt.LeftButton:
+            if self._window_dragging and self._drag_from is not None:
+                self._drag_from = None
                 self._snap_edge()
                 if self._on_moved:
                     self._on_moved(self.x(), self.y())
-            else:
-                self._poke()          # 只是戳了一下
+            elif self._interaction_active:
+                self._finish_interaction(self._dragged)
+            self._window_dragging = False
+            self.setCursor(Qt.PointingHandCursor)
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.LeftButton and self._open_app:
-            self._open_app()
+        if event.button() == Qt.LeftButton:
+            if event.modifiers() & Qt.ControlModifier and self._open_app:
+                self._open_app()
+            else:
+                self.trigger_surprise()
+            event.accept()
+            return
         super().mouseDoubleClickEvent(event)
 
     def enterEvent(self, event):
@@ -1549,7 +2594,11 @@ class DesktopPet(QWidget):
     def _poke(self):
         self._squash = 1.0
         self._blink = 4
-        self._auto_chat()
+        self._neutral_interaction()
+        self._interaction_velocity["scale_x"] += .30
+        self._interaction_velocity["scale_y"] -= .42
+        self._spawn_particles("spark", 3)
+        self._announce_interaction()
 
     def _show_menu(self, pos):
         menu = QMenu(self)
@@ -1559,7 +2608,9 @@ class DesktopPet(QWidget):
                            "QMenu::item:selected{background:#21262d;}")
         acts = {}
         pet_kind_actions = {}
+        interaction_actions = {}
         style_menu = menu.addMenu("切换宠物")
+        interaction_menu = menu.addMenu("互动玩法")
         for label, cb in [("打开主界面", self._open_app),
                           ("立即休息一下", self._rest_now),
                           ("切换护眼", self._toggle_care),
@@ -1576,9 +2627,19 @@ class DesktopPet(QWidget):
             act.setCheckable(True)
             act.setChecked(pet_kind == self._pet_kind)
             pet_kind_actions[act] = pet_kind
+        for mode, info in self.INTERACTION_MODES.items():
+            act = interaction_menu.addAction(info["label"])
+            act.setCheckable(True)
+            act.setChecked(mode == self._interaction_mode)
+            act.setToolTip(info["hint"])
+            interaction_actions[act] = mode
+        surprise = menu.addAction("来个小惊喜")
+        acts[surprise] = self.trigger_surprise
         chosen = menu.exec_(pos)
         if chosen in pet_kind_actions:
             self.set_pet_kind(pet_kind_actions[chosen])
+        elif chosen in interaction_actions:
+            self.set_interaction_mode(interaction_actions[chosen])
         else:
             cb = acts.get(chosen)
             if cb:
@@ -1588,7 +2649,9 @@ class DesktopPet(QWidget):
 class PetPreview(DesktopPet):
     """复用桌宠 renderer 的嵌入式预览，不创建桌面窗口。"""
 
-    def __init__(self, pet_kind, parent=None, animated=True, halo=True):
+    def __init__(self, pet_kind, parent=None, animated=True, halo=True,
+                 decoration=DesktopPet.DEFAULT_DECORATION,
+                 interaction_mode=DesktopPet.DEFAULT_INTERACTION_MODE):
         QWidget.__init__(self, parent)
         self._pet_kind = (pet_kind if pet_kind in self.PET_STYLES
                           else self.DEFAULT_PET_KIND)
@@ -1602,6 +2665,12 @@ class PetPreview(DesktopPet):
         self._total_secs = 0
         self._msg = ""
         self._halo = halo
+        self._interaction_mode = self.normalize_interaction_mode(interaction_mode)
+        self._on_interaction_mode_changed = None
+        self._init_interaction_state()
+        self._decoration = (decoration if decoration in self.DECORATIONS
+                            and self.DECORATIONS[decoration]["unlocked"]
+                            else self.DEFAULT_DECORATION)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setStyleSheet("background:transparent;border:none;")
@@ -1613,6 +2682,7 @@ class PetPreview(DesktopPet):
 
     def _tick_preview(self):
         self._phase += 0.08
+        self._tick_interaction(.08)
         if self._blink > 0:
             self._blink -= 1
         else:
@@ -1625,6 +2695,13 @@ class PetPreview(DesktopPet):
     def set_pet_kind(self, pet_kind):
         if pet_kind in self.PET_STYLES and pet_kind != self._pet_kind:
             self._pet_kind = pet_kind
+            self.update()
+
+    def set_decoration(self, decoration):
+        if (decoration in self.DECORATIONS
+                and self.DECORATIONS[decoration]["unlocked"]
+                and decoration != self._decoration):
+            self._decoration = decoration
             self.update()
 
     def set_state(self, state):
@@ -1646,6 +2723,26 @@ class PetPreview(DesktopPet):
             p.setPen(QPen(QColor(76, 172, 184, 28), 1))
             p.setBrush(Qt.NoBrush)
             p.drawEllipse(inner)
+            # 参考图里的轻量星光点缀，让预览区不再只有一圈空 halo。
+            p.setPen(Qt.NoPen)
+            for x, y, size, color in (
+                (0.17, 0.48, 9, QColor("#8de5dc")),
+                (0.82, 0.28, 7, QColor("#e6c878")),
+                (0.86, 0.67, 8, QColor("#9ec8e5")),
+                (0.20, 0.76, 5, QColor("#86a9c2")),
+            ):
+                cx, cy = self.width() * x, self.height() * y
+                star = QPainterPath()
+                star.moveTo(cx, cy - size)
+                star.lineTo(cx + size * .28, cy - size * .28)
+                star.lineTo(cx + size, cy)
+                star.lineTo(cx + size * .28, cy + size * .28)
+                star.lineTo(cx, cy + size)
+                star.lineTo(cx - size * .28, cy + size * .28)
+                star.lineTo(cx - size, cy)
+                star.lineTo(cx - size * .28, cy - size * .28)
+                star.closeSubpath()
+                p.setBrush(color); p.drawPath(star)
 
         available_width = max(1, self.width() - (22 if self._halo else 4))
         available_height = max(1, self.height() - (12 if self._halo else 2))
@@ -1712,6 +2809,7 @@ class CareEyesApp(QWidget):
         self.autostart = False; self.sound_enabled = True
         self.pet_enabled = True
         self.pet_kind = DesktopPet.DEFAULT_PET_KIND
+        self.pet_interaction_mode = DesktopPet.DEFAULT_INTERACTION_MODE
         self.pet_pos = None
         self.today_minutes = 0; self.break_count = 0
         self.week_data = {}
@@ -1798,6 +2896,8 @@ class CareEyesApp(QWidget):
             toggle_care=self._hk_toggle,
             on_moved=self._on_pet_moved,
             pet_kind=self.pet_kind,
+            interaction_mode=self.pet_interaction_mode,
+            on_interaction_mode_changed=self._on_pet_interaction_mode_changed,
         )
         self.pet.setVisible(False)
         self.pet.set_countdown(self._next_rest_secs, self.rest_interval_min * 60)
@@ -1826,6 +2926,29 @@ class CareEyesApp(QWidget):
             self.pet.set_pet_kind(pet_kind)
         self._sync_pet_page()
         self._schedule_save()
+
+    def _set_pet_interaction_mode(self, mode):
+        mode = DesktopPet.normalize_interaction_mode(mode)
+        changed = mode != self.pet_interaction_mode
+        self.pet_interaction_mode = mode
+        if self.pet is not None and self.pet.interaction_mode != mode:
+            self.pet.set_interaction_mode(mode)
+        self._sync_pet_page()
+        if changed:
+            self._schedule_save()
+
+    def _on_pet_interaction_mode_changed(self, mode):
+        """桌面右键菜单改玩法时，把选择同步回主界面和配置。"""
+        mode = DesktopPet.normalize_interaction_mode(mode)
+        if mode == self.pet_interaction_mode:
+            return
+        self.pet_interaction_mode = mode
+        self._sync_pet_page()
+        self._schedule_save()
+
+    def _trigger_pet_surprise(self):
+        if self.pet is not None:
+            self.pet.trigger_surprise()
 
     def _open_main(self):
         self.show()
@@ -1889,6 +3012,7 @@ class CareEyesApp(QWidget):
         pet_preview = controls.get("pet_preview")
         if pet_preview is not None:
             pet_preview.set_pet_kind(self.pet_kind)
+            pet_preview.set_interaction_mode(self.pet_interaction_mode)
             state = self._current_pet_state()
             pet_preview.set_state(state)
         pet_name_label = controls.get("pet_name_label")
@@ -1901,6 +3025,20 @@ class CareEyesApp(QWidget):
             for pet_kind, button in pet_skin_buttons.items():
                 button.blockSignals(True)
                 button.setChecked(pet_kind == self.pet_kind)
+                button.blockSignals(False)
+        pet_interaction_hint_label = controls.get("pet_interaction_hint_label")
+        if pet_interaction_hint_label is not None:
+            interaction = DesktopPet.INTERACTION_MODES[self.pet_interaction_mode]
+            move_hint = ("左键拖动移动" if self.pet_interaction_mode == "move"
+                         else "Shift+拖动移动")
+            pet_interaction_hint_label.setText(
+                f"{interaction['label']}：{interaction['hint']} · {move_hint}"
+            )
+        pet_interaction_buttons = controls.get("pet_interaction_buttons")
+        if pet_interaction_buttons is not None:
+            for mode, button in pet_interaction_buttons.items():
+                button.blockSignals(True)
+                button.setChecked(mode == self.pet_interaction_mode)
                 button.blockSignals(False)
         pet_mood_label = controls.get("pet_mood_label")
         if pet_mood_label is not None:
@@ -2382,7 +3520,10 @@ class CareEyesApp(QWidget):
         )
         hero_layout.addWidget(self.pet_speech_label)
 
-        self.pet_preview = PetPreview(self.pet_kind, hero, animated=True, halo=True)
+        self.pet_preview = PetPreview(
+            self.pet_kind, hero, animated=True, halo=True,
+            interaction_mode=self.pet_interaction_mode,
+        )
         self.pet_preview.setMinimumSize(300, 250)
         self.pet_preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         hero_layout.addWidget(self.pet_preview, 1)
@@ -2480,6 +3621,53 @@ class CareEyesApp(QWidget):
         self.pet_page_progress.setRange(0, 100)
         self.pet_page_progress.setTextVisible(False)
         companion_layout.addWidget(self.pet_page_progress)
+
+        companion_layout.addSpacing(3)
+        companion_layout.addWidget(self._div())
+        play_head = QHBoxLayout()
+        play_title = QLabel("互动玩法")
+        play_title.setStyleSheet("color:#dce7f2;font-size:12px;font-weight:700;")
+        self.pet_surprise_button = QPushButton("彩蛋")
+        self.pet_surprise_button.setCursor(Qt.PointingHandCursor)
+        self.pet_surprise_button.setFixedSize(48, 24)
+        self.pet_surprise_button.setStyleSheet(
+            "QPushButton{background:#263b51;color:#b9ddf6;border:1px solid #3c5871;"
+            "border-radius:7px;font-size:10px;}"
+            "QPushButton:hover{background:#304d68;color:#e2f4ff;}"
+        )
+        self.pet_surprise_button.clicked.connect(self._trigger_pet_surprise)
+        play_head.addWidget(play_title)
+        play_head.addStretch()
+        play_head.addWidget(self.pet_surprise_button)
+        companion_layout.addLayout(play_head)
+        self.pet_interaction_hint_label = QLabel()
+        self.pet_interaction_hint_label.setWordWrap(True)
+        self.pet_interaction_hint_label.setStyleSheet(
+            "color:#8295ac;font-size:10px;background:transparent;"
+        )
+        companion_layout.addWidget(self.pet_interaction_hint_label)
+        interaction_row = QHBoxLayout()
+        interaction_row.setSpacing(4)
+        self.pet_interaction_buttons = {}
+        for mode, info in DesktopPet.INTERACTION_MODES.items():
+            button = QPushButton(info["label"])
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setFixedHeight(28)
+            button.setToolTip(info["hint"])
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            button.setStyleSheet(
+                "QPushButton{background:#1d2c3b;color:#91a7ba;border:1px solid #304558;"
+                "border-radius:7px;font-size:10px;padding:0 3px;}"
+                "QPushButton:hover{background:#243b4f;color:#d3e3ef;border-color:#52748d;}"
+                "QPushButton:checked{background:#164550;color:#c9fffa;border-color:#60d8ce;}"
+            )
+            button.clicked.connect(
+                lambda _, selected=mode: self._set_pet_interaction_mode(selected)
+            )
+            self.pet_interaction_buttons[mode] = button
+            interaction_row.addWidget(button)
+        companion_layout.addLayout(interaction_row)
         side.addWidget(companion)
         content.addLayout(side, 4)
         lay.addLayout(content, 1)
@@ -3060,6 +4248,7 @@ class CareEyesApp(QWidget):
             self.sound_enabled = True
             self.pet_enabled = True
             self.pet_kind = DesktopPet.DEFAULT_PET_KIND
+            self.pet_interaction_mode = DesktopPet.DEFAULT_INTERACTION_MODE
             self.autostart = False
             self.temp_slider.setValue(5000)
             self.bright_slider.setValue(100)
@@ -3094,6 +4283,7 @@ class CareEyesApp(QWidget):
         self.pet_pos = None                 # 桌宠回到右下角默认位置
         if self.pet is not None:
             self.pet.set_pet_kind(self.pet_kind)
+            self.pet.set_interaction_mode(self.pet_interaction_mode)
         self._hide_pet()
         self._show_pet()
         if self.pet is not None:
@@ -3133,7 +4323,8 @@ class CareEyesApp(QWidget):
         "sound_enabled":True,"stat_date":"","today_minutes":0,"break_count":0,
         "today_seconds":-1.0,
         "week_data":{},
-        "pet_enabled":True,"pet_kind":"blue_cat","pet_pos":[],
+        "pet_enabled":True,"pet_kind":"blue_cat",
+        "pet_interaction_mode":"move","pet_pos":[],
     }
 
     def load_settings(self):
@@ -3162,6 +4353,9 @@ class CareEyesApp(QWidget):
         self.pet_enabled=cfg["pet_enabled"]
         self.pet_kind = (cfg["pet_kind"] if cfg["pet_kind"] in DesktopPet.PET_STYLES
                          else DesktopPet.DEFAULT_PET_KIND)
+        self.pet_interaction_mode = DesktopPet.normalize_interaction_mode(
+            cfg["pet_interaction_mode"]
+        )
         self.pet_pos=_parse_position(cfg["pet_pos"])
         cutoff = date.today() - timedelta(days=31)
         week_data = cfg["week_data"] if isinstance(cfg["week_data"], dict) else {}
@@ -3221,6 +4415,9 @@ class CareEyesApp(QWidget):
             "break_count":self.break_count,"week_data":self.week_data,
             "pet_enabled":self.pet_enabled,
             "pet_kind":vars(self).get("pet_kind", DesktopPet.DEFAULT_PET_KIND),
+            "pet_interaction_mode":vars(self).get(
+                "pet_interaction_mode", DesktopPet.DEFAULT_INTERACTION_MODE
+            ),
             "pet_pos":self.pet_pos or [],
         }
         tmp = CONFIG_FILE + ".tmp"
